@@ -1,0 +1,78 @@
+//-----------------------------------------------------------------------------
+// switch_law.clh -- the SURROGATE SVD/THP switching law. NOT the law main.tex
+// derives, and NOT what the pipeline deploys. One definition, compiled into
+// both sides so the two cannot drift:
+//   host   : ref/hp_ref.cpp              (fp64 golden reference, via -Ikernels)
+//   device : kernels/switch_threshold.cl (fp32, via Runtime's include inliner)
+//
+// WHAT THIS IS. An O(1) slot that needs only lambda_min and g_min: no
+// quadrature, no Newton, no dependence on M beyond eta. Useful as a PL-side
+// pre-filter or a cheap sanity bound. It has no production oracle of its own --
+// op_bench checks kernel == host reference, not kernel == deployed policy.
+//
+// WHAT THE DEPLOYED LAW IS. The closed form + safeguarded Newton threshold of
+// kernels/threshold_cf.cl / ref/threshold_cf.cpp, which ref/pipeline.cpp calls
+// via threshold_closed_form() and which is what main.tex eq. (cf) derives from
+// the bit-metric deficit model. main.tex:147-152 (Corollary 1) says that law
+// grows as 10*log10(M-1) in modulation order and 10*log10(T) in stream count,
+// and depends on N_t and N_RF "only through lambda_min and g_min".
+//
+// THE TWO ARE NOT THE SAME FUNCTION, and this file must not be read as a
+// special case of the paper's law:
+//   * (nt/nrf) below is an EXPLICIT N_t/N_RF factor, which Corollary 1 says the
+//     threshold must not have. It is the single clearest contradiction.
+//   * this law has no M dependence at all except through eta = 1+(d-1)/(d(M-1)),
+//     which moves 0.18 dB between M=16 and M=64 -- against the ~6 dB per
+//     10*log10(M-1) step the closed form produces. It has no T = K*d dependence
+//     either. So it cannot reproduce the paper's modulation or stream scaling.
+//   * magnitude: with nt=8, nrf=16, eta~1.01 and g_min >= lambda_min this law
+//     returns tau_dB <= 10*log10(nt/nrf*eta) ~ -2.9 dB, while the closed form
+//     returns +29..+47 dB on the cf_bench pool. They are not on the same scale,
+//     so "sanity bound" means "same sign of the decision", not "close number".
+//   * functional form: linear in lambda_min/g_min here, logarithmic in the
+//     closed form (u*_0 is a ratio of logs).
+//
+// WHAT IS SHARED, and the only thing that must stay in step: the comparison
+// direction. main.tex:52 specifies "THP if s >= tau", ref/pipeline.cpp:119 uses
+// >=, so >= is the contract here too. An earlier copy of this law used a strict
+// >, which disagrees with the paper exactly on the boundary. Note that ref/
+// pipeline.cpp writes its own >= inline rather than calling switch_selects_thp()
+// -- it is the deployed law's decision, this file is the surrogate's -- so the
+// direction is duplicated by design and both must be checked when it changes.
+//
+// Coverage note for op_bench: the switch_threshold case historically passed
+// nt = nrf = 16 and eta = 1.0, which multiplies BOTH the (nt/nrf) and the eta
+// factor by exactly 1, and drew lambda_min/g_min from independent uniforms so
+// neither HPOCL_GMIN_FLOOR nor HPOCL_TAULIN_FLOOR was ever reached; with
+// continuous metric_dB the >= boundary is hit with probability 0. Varying nt,
+// nrf and eta, adding a g_min == 0 case and an exact metric_dB == tau_dB case
+// is what makes those three lines observable.
+//
+// Plain C arithmetic only, so the same text is valid OpenCL C and C++.
+//-----------------------------------------------------------------------------
+#ifndef HPOCL_SWITCH_LAW_CLH
+#define HPOCL_SWITCH_LAW_CLH
+
+// g_min is a geometric mean of squared singular values and can underflow to 0
+// on a rank-deficient channel; flooring it keeps tau finite instead of inf.
+#define HPOCL_GMIN_FLOOR   1e-12f
+// log10 argument floor: 10*log10(1e-20) = -200 dB, far below any operating
+// point, so clamping there is indistinguishable from -inf for the decision.
+#define HPOCL_TAULIN_FLOOR 1e-20f
+
+static inline float switch_tau_lin(float lambda_min, float g_min,
+                                   float nt, float nrf, float eta) {
+  float gm = g_min > HPOCL_GMIN_FLOOR ? g_min : HPOCL_GMIN_FLOOR;
+  return (nt / nrf) * eta * (lambda_min / gm);
+}
+
+static inline float switch_tau_db(float tau_lin) {
+  return 10.0f * log10(tau_lin > HPOCL_TAULIN_FLOOR ? tau_lin : HPOCL_TAULIN_FLOOR);
+}
+
+// 1 -> THP branch, 0 -> SVD branch. main.tex: "THP if s >= tau".
+static inline int switch_selects_thp(float metric_db, float tau_db) {
+  return metric_db >= tau_db ? 1 : 0;
+}
+
+#endif  // HPOCL_SWITCH_LAW_CLH

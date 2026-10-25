@@ -1,0 +1,8 @@
+# build artifacts (binaries, vectors, dSYM) -- regenerate with make/tools
+/build/
+# macOS noise
+.DS_Store
+# editor
+*.swp
+.idea/
+.vscode/

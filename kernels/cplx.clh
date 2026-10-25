@@ -1,0 +1,78 @@
+//-----------------------------------------------------------------------------
+// cplx.clh -- the one device-side definition of complex arithmetic and of the
+// THP centered modulo.
+//
+// Complex numbers are float2(re, im) throughout the fp32 datapath. Before this
+// header existed the same five helpers were retyped in datapath.cl,
+// thp_precoder.cl and decomp.cl, wbb_apply.cl and channel_cov.cl inlined the
+// multiply-accumulate by hand, and the *centered modulo* had six copies under
+// five names (fold_axis, mod_tau, an anonymous lambda in ref/hp_ref.cpp,
+// fold_axis again in ref/modem.cpp, mod_fold in two tools/*_ref.py).
+//
+// That is not a stylistic complaint: runtime/bench_main.cpp still carries the
+// scar of the last time these copies disagreed --
+//   "a regression check: the fold used to be tau^2 on the kernel"
+// i.e. the device folded by a different period than the host, and only a
+// deliberately crafted tau=1 case caught it.
+//
+// Unification here is bit-exact by construction: `0.5f * period` and
+// `period / 2.0f` are the same fp32 value (halving is exact in binary), and
+// IEEE-754 multiplication is commutative, so cmod_axis() reproduces both
+// previous spellings bit for bit. datapath_bench asserts the fold against the
+// production python exactly, so any drift fails the build.
+//
+// Host-side twin of the modulo: include/hpocl_modulo.h (the host gets its
+// complex arithmetic from std::complex, so only the fold is shared). Keep the
+// two spellings of cmod_axis in step.
+//-----------------------------------------------------------------------------
+// Classic include guard, not `#pragma once`: Runtime::build() inlines
+// #include textually and clCreateProgramWithSource concatenates every .cl into a
+// single program source, so several kernels including this header land in one
+// translation unit. A guard is what makes that legal (and `#pragma once` in a
+// textually-inlined file is not recognized as a header by the CL compiler).
+#ifndef HPOCL_CPLX_CLH
+#define HPOCL_CPLX_CLH
+
+// ---- arithmetic -----------------------------------------------------------
+static inline float2 cmul(float2 a, float2 b) {              // a * b
+  return (float2)(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+static inline float2 cmulc(float2 a, float2 b) {             // conj(a) * b
+  return (float2)(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
+}
+static inline float2 cmulr(float2 a, float2 b) {             // a * conj(b)
+  return (float2)(a.x * b.x + a.y * b.y, a.y * b.x - a.x * b.y);
+}
+static inline float2 cadd(float2 a, float2 b) { return (float2)(a.x + b.x, a.y + b.y); }
+static inline float2 csub(float2 a, float2 b) { return (float2)(a.x - b.x, a.y - b.y); }
+static inline float2 cconj(float2 a) { return (float2)(a.x, -a.y); }
+static inline float2 cdiv(float2 a, float2 b) {              // a / b
+  float inv = 1.0f / (b.x * b.x + b.y * b.y);
+  return (float2)((a.x * b.x + a.y * b.y) * inv, (a.y * b.x - a.x * b.y) * inv);
+}
+// accumulate forms: same operation order as the hand-inlined loops they replace
+static inline float2 cmac(float2 acc, float2 a, float2 b) {   // acc + a * b
+  return (float2)(acc.x + a.x * b.x - a.y * b.y, acc.y + a.x * b.y + a.y * b.x);
+}
+static inline float2 cmacr(float2 acc, float2 a, float2 b) {  // acc + a * conj(b)
+  return (float2)(acc.x + a.x * b.x + a.y * b.y, acc.y + a.y * b.x - a.x * b.y);
+}
+
+// ---- THP centered modulo --------------------------------------------------
+// thp_precoding.centered_modulo_complex: fold onto [-period/2, period/2) using
+// the floor form (not round-half-away), which is what makes the folded receiver
+// match the production datapath exactly at the cell edges.
+//
+// fp32 caveat: the map is discontinuous at +-period/2, so an input within about
+// one ulp of an edge can land on the opposite edge -- a full period jump. This
+// is inherent to the production definition, not to this implementation; the
+// soft demodulator tolerates it because a whole-period shift maps a candidate
+// onto another candidate of the same replica lattice.
+static inline float cmod_axis(float x, float period) {
+  return x - period * floor((x + 0.5f * period) / period);
+}
+static inline float2 cmod(float2 v, float period) {
+  return (float2)(cmod_axis(v.x, period), cmod_axis(v.y, period));
+}
+
+#endif  // HPOCL_CPLX_CLH
