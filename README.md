@@ -840,3 +840,19 @@ compiling. `CF_VERBOSE=1` prints the per-channel threshold trace.
 - **缺口**：Linux Vitis（约 40–60 GB，WSL Ubuntu 22.04 或 Linux 机）+ XRT、
   ZCU49DR 平台 .xsa/.xpfm（现仅有 zcu102/zcu104）、Xilinx 许可（ZCU49DR 是否额外授权
   待确认）、上板硬件/SD 卡镜像流程。详见缺失清单。
+
+## 部署架构与后续射频通路（2026-10 固化决策）
+
+- **当前分工（hpocl 覆盖的负载）**：
+  - kernel（29 个 .cl）→ **PL**（FPGA 编织，综合成硬件），与 ARM 核无关；
+  - host（runtime/*.cpp + bench）→ **PS 侧 Linux（4× Cortex-A53 的任意核）**，代码不依赖核数
+    （无 pthread/OpenMP/亲和性代码，Linux 调度器决定实际核）；
+  - **2× Cortex-R5F 当前闲置**——hpocl 无硬实时控制任务，不"为用而用"。
+- **后续（16T16R 射频数据通路）才需要 R5F**：
+  - 多通道 RF-DAC/RF-ADC 需要 µs 级实时同步/触发/帧定时，A53 Linux 非实时（ms 级抖动）；
+  - 届时 R5F（裸机/FreeRTOS + RPMsg）或 PL 状态机上场，同时需要板厂 RFDC + JESD204 参考设计；
+  - 已同步至 `docs/QX49DR_SV3_上板依赖清单.md`。
+- **信号源模式（约束）**：无外部射频信号源；基带 IQ 波形由**本地电脑软件生成**（与
+  tools/ numpy oracle 同源），灌给板上 PS/PL；RFSoC 片内 RF-DAC 负责数模 + 上变频直接
+  发射频（DC–6GHz），RF-ADC 下变频回基带；发射-接收可用板上回环（Loopback）自测，
+  无需天线/外部仪器。
