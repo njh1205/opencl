@@ -430,6 +430,120 @@ def main(argv=None) -> int:
               f"(M={wq_at[0]} {'mod' if wq_at[1] else 'fin'} t={wq_at[2]:g}); GH-48's "
               f"own error there is <= 1.1e-4 dB, so this is agreement, not accuracy")
 
+    # ------------------------------------------------------------------
+    # 7. the Lagrange BASIS DERIVATIVES used for the analytic psi_du
+    # ------------------------------------------------------------------
+    # ref/threshold_cf.cpp dft_lookup_d() and kernels/threshold_cf.cl
+    # dft_lookup_d() return d ln D / d ln t^2 alongside the value, so that psi_du
+    # needs ONE Psi fill instead of three. The derivative is of the interpolant:
+    # sum_k w'_k(f) y_{i0+k} scaled by 0.5/DFT_DLNT, with A = f-1, B = f-2,
+    # C = f-3 and
+    #   w' = ( -(BC+AC+AB)/6, (BC+fC+fB)/2, -(AC+fC+fA)/2, (AB+fB+fA)/6 ).
+    #
+    # Part 1 is table-independent and tolerance-free. A cubic interpolant
+    # reproduces cubics exactly, so its derivative must reproduce cubic
+    # derivatives exactly: for every f and every i0, with x = i0 + f,
+    #   sum_k w'_k           = 0       (derivative of a partition of unity)
+    #   sum_k w'_k (i0+k)    = 1       (d/dx of x)
+    #   sum_k w'_k (i0+k)^2  = 2x      (d/dx of x^2)
+    #   sum_k w'_k (i0+k)^3  = 3x^2    (d/dx of x^3)
+    # A sign error, a transposed stencil or a wrong denominator fails one of these
+    # at machine precision -- which no comparison against the table can do, since
+    # the table only constrains the single combination sum_k w'_k y_k.
+    def wprime(f):
+        A, B, C = f - 1.0, f - 2.0, f - 3.0
+        return (-(B * C + A * C + A * B) / 6.0, (B * C + f * C + f * B) / 2.0,
+                -(A * C + f * C + f * A) / 2.0, (A * B + f * B + f * A) / 6.0)
+    # The residual is normalized by the SIZE OF THE TERMS, not by the size of the
+    # result, because the identities are catastrophically cancelling at the top of
+    # the grid: sum_k w'_k (i0+k)^3 has terms of order i0^3 ~ 4e9 and a result of
+    # order 3x^2 ~ 7.6e6, so even exactly-correct w'_k leave ~1e-12 of round-off
+    # against a result-relative bound. Term-relative, the same arithmetic is exact
+    # to ~1e-16 -- and a sign error, a transposed stencil or a wrong denominator
+    # is still O(1) term-relative, so the check loses no power.
+    wp_worst = 0.0
+    for f in np.linspace(0.0, 3.0, 61):
+        for i0 in (0, 1, 7, 800, n - 5, n - 4):
+            wp = wprime(float(f))
+            x = i0 + float(f)
+            for power, want in ((0, 0.0), (1, 1.0), (2, 2.0 * x), (3, 3.0 * x * x)):
+                got = sum(w * (i0 + k) ** power for k, w in enumerate(wp))
+                terms = sum(abs(w) * abs(i0 + k) ** power for k, w in enumerate(wp))
+                wp_worst = max(wp_worst, abs(got - want) / max(1.0, terms))
+    if wp_worst > 1e-13:
+        fail(f"Lagrange basis derivatives fail exact cubic reproduction: "
+             f"{wp_worst:.3e} > 1e-13 term-relative (a sign error, a transposed "
+             f"stencil or a wrong denominator; the identities are exact, so this "
+             f"is not noise)")
+    print(f"[deficit_check] basis derivatives: exact cubic reproduction to "
+          f"{wp_worst:.2e} term-relative over 61 f x 6 i0 x 4 identities "
+          f"(table-independent; exact to round-off)")
+
+    # Part 2 pins the SCALE, which part 1 cannot: confusing d/d ln t with
+    # d/d ln t^2 (the factor 0.5) satisfies all four identities above and is
+    # caught only by the numbers. Two properties of the committed grid:
+    #   (a) d ln D / d ln t < 0 everywhere -- ln D is strictly decreasing (check
+    #       5a tests the values; this tests the derivative of the same row);
+    #   (b) near the top of the grid it must approach the analytic tail's own
+    #       derivative, d(ln C + lnQ_asym)/d ln t = -t^2 - 1 + t c'/c, because
+    #       the grid and the tail describe the same function and the handover at
+    #       DFT_THI is worth 5.2e-3 dB (check 5d).
+    # (a) holds only for t >= DFT_TMONO, and check 5a is what establishes that:
+    # the FOLDED rows have a real non-monotonic bump at low t (measured there: the
+    # mod rows rise by <= 1.67e-02 nats total, 7.27e-02 dB, reproduced by GH-48,
+    # i.e. a property of the modulo deficit and not of the table). The first
+    # version of this check tested every node and failed at row 1 (M=4 mod)
+    # index 1027, t = 0.34, with d ln D/d ln t = +3.25e-02 -- correctly, and the
+    # fix is to test the derivative exactly where the values are already known to
+    # be monotone, not to loosen the bound.
+    dln_worst_neg = -float("inf")   # the LARGEST (least negative) derivative;
+    dln_neg_at = None               # -inf, not 0.0, so an all-negative row does
+                                    # not read as a failure at the >= 0 test below
+    tail_rel = 0.0
+    tail_at = None
+    dlnt = P["DFT_DLNT"]
+    i_mono = int(np.ceil(np.log(DFT_TMONO / P["DFT_TLO"]) / dlnt))
+    for r in range(rows):
+        y = A[r]
+        for i in range(max(2, i_mono), n - 3):
+            f = 1.0                      # x = i exactly: i0 = i-1, f = 1
+            wp = wprime(f)
+            dln_t2 = sum(w * y[i - 1 + k] for k, w in enumerate(wp)) * (0.5 / dlnt)
+            dln_t = 2.0 * dln_t2         # what (b) is stated in
+            if dln_t > dln_worst_neg:
+                dln_worst_neg, dln_neg_at = dln_t, (r, i)
+        # (b) at the last interior node
+        i = n - 3
+        wp = wprime(1.0)
+        dln_t2 = sum(w * y[i - 1 + k] for k, w in enumerate(wp)) * (0.5 / dlnt)
+        dln_t = 2.0 * dln_t2
+        t = P["DFT_TLO"] * np.exp(i * dlnt)
+        t2, t4 = t * t, t ** 4
+        c = 1.0 - 1.0 / t2 + 3.0 / t4
+        want = -t2 - 1.0 + (2.0 / t2 - 12.0 / t4) / c
+        rel = abs(dln_t - want) / abs(want)
+        if rel > tail_rel:
+            tail_rel, tail_at = rel, r
+    if dln_worst_neg >= 0.0:
+        r, i = dln_neg_at
+        fail(f"d ln D/d ln t is not negative for t >= {DFT_TMONO:g}: "
+             f"{dln_worst_neg:+.3e} at "
+             f"row {r} index {i}. Either the basis derivatives or the 0.5/DFT_DLNT "
+             f"scale is wrong (a factor-of-two scale error satisfies every exact "
+             f"identity in part 1).")
+    if tail_rel > 5e-3:
+        fail(f"d ln D/d ln t does not match the analytic tail's derivative at "
+             f"t = DFT_THI: {tail_rel:.3e} > 5e-3 relative (row {tail_at}). This "
+             f"is the check that pins the SCALE of the derivative, which the "
+             f"exact cubic identities cannot.")
+    print(f"[deficit_check] d ln D/d ln t: negative on all {rows} rows for "
+          f"t >= {DFT_TMONO:g} (worst {dln_worst_neg:.3e}; below that the folded "
+          f"rows have check 5a's documented low-t bump, so the derivative is "
+          f"legitimately positive there); matches the analytic "
+          f"tail's -t^2-1+tc'/c at t=DFT_THI to {tail_rel:.2e} relative "
+          f"({4.342944819*abs(dln_worst_neg):.3g} dB/ln t at the shallowest row) "
+          f"-- this is what pins the 0.5 factor")
+
     if a.full:
         with tempfile.TemporaryDirectory() as td:
             h2 = pathlib.Path(td) / "deficit_table.h"

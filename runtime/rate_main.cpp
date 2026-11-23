@@ -20,34 +20,25 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <string>
 #include <vector>
 #include "hpocl_runtime.h"
+#include "hpocl_vecio.h"
 #include "mcs_table.clh"   // host side of the device table: cqi_select/cqi_se
 
 using hpocl::McsSel;
 using hpocl::Runtime;
 
 namespace {
-struct Reader {                               // little-endian, bounds-checked
-  std::vector<uint8_t> buf; size_t o = 0; bool bad = false;
-  explicit Reader(const char* path) {
-    std::ifstream f(path, std::ios::binary);
-    buf.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  }
-  const uint8_t* take(size_t n) {
-    if (o + n > buf.size()) { bad = true; return buf.data(); }
-    const uint8_t* p = buf.data() + o; o += n; return p;
-  }
-  int i() { int v = 0; memcpy(&v, take(4), 4); return v; }
-  double d() { double v = 0; memcpy(&v, take(8), 8); return v; }
-  void i32(std::vector<int>& v) { memcpy(v.data(), take(4 * v.size()), 4 * v.size()); }
-  void f32(std::vector<float>& v) { memcpy(v.data(), take(4 * v.size()), 4 * v.size()); }
-  void f64(std::vector<double>& v) { memcpy(v.data(), take(8 * v.size()), 8 * v.size()); }
-  void u8(std::vector<uint8_t>& v) { memcpy(v.data(), take(v.size()), v.size()); }
-};
+// hpocl::VecReader (include/hpocl_vecio.h) is the shared bounds-checked reader;
+// it names the float64/complex128/uint8 shapes but not the two integer-width
+// columns this vector file carries, so those two go through its raw() entry
+// point. Same memcpy, same bounds check, no second reader implementation.
+void rd_f32(hpocl::VecReader& r, std::vector<float>& v) {
+  r.raw(v.data(), sizeof(float) * v.size(), "float32[]");
+}
+void rd_i32(hpocl::VecReader& r, std::vector<int>& v) {
+  r.raw(v.data(), sizeof(int32_t) * v.size(), "int32[]");
+}
 
 int maxdiff_i(const std::vector<int>& a, const std::vector<int>& b) {
   int m = 0;
@@ -69,7 +60,12 @@ double maxdiff_d(const std::vector<float>& got, const std::vector<double>& exp) 
 }  // namespace
 
 int main(int argc, char** argv) {
-  Reader rd(argc > 1 ? argv[1] : "build/rate_vectors.bin");
+  const char* vec = argc > 1 ? argv[1] : "build/rate_vectors.bin";
+  hpocl::VecReader rd(vec);
+  if (!rd.ok()) {
+    fprintf(stderr, "[rate] %s (run: python3 tools/rate_ref.py)\n", rd.error().c_str());
+    return 2;
+  }
   Runtime rt;
   const char* dev = argc > 2 ? argv[2] : "cpu";
   if (!rt.init(dev) || !rt.load_program({"kernels/rate.cl"})) {
@@ -84,14 +80,25 @@ int main(int argc, char** argv) {
   double worst_cl = 0, worst_host = 0;
   for (int ci = 0; ci < ncase; ++ci) {
     const int K = rd.i();
-    const float eps = (float)rd.d();
+    const float eps = (float)rd.f();
+    // Pre-flight: K sizes the eight vectors below and comes from the file, and
+    // every vector file in this repo is argv[1]. A wrong file reads a garbage K
+    // and asks for gigabytes before any bounds check can fire (VecReader checks
+    // each read, which is too late); take() validates without consuming.
+    if (K < 1 || K > 65536) {
+      fprintf(stderr, "[rate] case%d: implausible K=%d -- wrong vector file? "
+              "(run: python3 tools/rate_ref.py)\n", ci, K);
+      return 2;
+    }
+    if (!rd.take(12 * (size_t)K + 24 * (size_t)K + (size_t)K, "rate case"))
+      return 2;
     std::vector<float> gmi(K);
     std::vector<int> eidx(K), em(K), er(K);
     std::vector<double> ese(K), emarg(K), einfo(K);
     std::vector<uint8_t> eout(K);
-    rd.f32(gmi); rd.i32(eidx); rd.i32(em); rd.i32(er);
-    rd.f64(ese); rd.f64(emarg); rd.f64(einfo); rd.u8(eout);
-    if (rd.bad) { fprintf(stderr, "[rate] truncated vectors file\n"); return 2; }
+    rd_f32(rd, gmi); rd_i32(rd, eidx); rd_i32(rd, em); rd_i32(rd, er);
+    rd.re(ese); rd.re(emarg); rd.re(einfo); rd.by(eout);
+    if (rd.bad()) return 2;              // VecReader already printed the offset
 
     // ---- host side: the very same mcs_table.clh text the device compiles ----
     std::vector<int> hidx(K), hm(K), hr(K);
@@ -151,11 +158,7 @@ int main(int argc, char** argv) {
            ci, K, eps, d_idx_h, d_idx_c, d_m_h, d_m_c, d_r_h, d_r_c, d_out,
            e_se, e_mg, e_in, e_hs, sum_se, nout, K, ok ? "PASS" : "FAIL");
   }
-  if (rd.o != rd.buf.size()) {
-    fprintf(stderr, "[rate] %zu trailing bytes (contract drift?)\n",
-            rd.buf.size() - rd.o);
-    ++fails;
-  }
+  if (!rd.expect_done("rate_bench")) ++fails;   // contract drift vs the oracle
   printf("[rate_bench] worst kernel-vs-oracle %.2e, host-vs-oracle %.2e\n",
          worst_cl, worst_host);
   printf(fails ? "[rate_bench] FAIL\n" : "[rate_bench] ALL PASS\n");

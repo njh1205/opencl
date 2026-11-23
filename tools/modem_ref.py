@@ -8,7 +8,9 @@ Ground truth is the production python in mix_precode/classical:
                   stable_binary_logloss_from_signed_llr,
                   estimate_bicm_gmi_parallel_from_received,
                   estimate_bicm_gmi_thp_from_received
-Scope: gray_standard labeling, square QAM M in {16, 64, 256}.
+Scope: gray_standard labeling, square QAM M in {4, 16, 64, 256} -- every order
+production's get_constellation accepts, and every order the fp32 kernels reach
+through Runtime's dp_dims_ok (m even, 2..8).
 
 Metric convention being pinned down (n0 = E|noise|^2 per complex sample):
   d2      = |y - candidate|^2,   metric = -d2 / n0
@@ -46,8 +48,14 @@ from bicm_metrics import (bit_llr_from_distances, enumerate_thp_symbol_replicas,
 from thp_precoding import centered_modulo_complex, qam_axis_order_and_spacing
 
 NSYM = 512            # symbols per case
-REPLICA_RADIUS = 2    # |l| <= 2 shifts per axis in the folded branch
-ORDERS = (16, 64, 256)
+# |l| <= 2 shifts per axis in the folded branch. At QPSK this radius is not a
+# formality: the period is 2*delta, so a shift by -2*delta lands a replica
+# exactly delta from a base point and the flipped-bit subset gains a SECOND
+# co-minimal candidate. The folded LLR therefore differs from the parallel one
+# by log(2) there (both sides compute it from the same lattice, so they agree);
+# tools/datapath_ref.py's QPSK case exercises the same effect on the device.
+REPLICA_RADIUS = 2
+ORDERS = (4, 16, 64, 256)     # QPSK included: production and the kernels take it
 NOISE = (0.5, 0.1, 0.02)          # n0: 3 dB, 10 dB, 17 dB per complex symbol
 SEED0 = 20261024
 CASES = [(M, n0, SEED0 + 97 * k)

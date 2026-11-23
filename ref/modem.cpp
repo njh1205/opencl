@@ -30,8 +30,12 @@ double logsumexp(const double* v, int n) {
   return mx + std::log(sum);
 }
 
-// Unit-average-power scale of get_constellation: sqrt(10), sqrt(42), sqrt(170)
-// for L = 4, 8, 16 PAM points per axis.
+// Unit-average-power scale of get_constellation: sqrt(2), sqrt(10), sqrt(42),
+// sqrt(170) for L = 2, 4, 8, 16 PAM points per axis. Spelled 2(L^2-1)/3 rather
+// than the kernels' equivalent 6/(M-1) under a square root, because this file
+// mirrors production, which normalises 16/64/256-QAM by sqrt(10)/sqrt(42)/
+// sqrt(170) and QPSK by sqrt(2) = 2/sqrt(2) * ... i.e. by the same 2/norm rule
+// (thp_precoding.qam_axis_order_and_spacing's spacing_map).
 double pam_norm(int L) { return std::sqrt(2.0 * (L * L - 1) / 3.0); }
 
 // PAM index -> Gray label (idx ^ (idx >> 1)) written MSB first into out[ma];
@@ -51,7 +55,19 @@ double pam_from_gray(const uint8_t* b, int ma) {
 }
 
 // One constellation table plus its geometry; empty (ok() false) if the order is
-// outside {16, 64, 256}, mirroring the ValueError of get_constellation.
+// outside {4, 16, 64, 256}, mirroring the ValueError of get_constellation.
+//
+// ROW ORDER, and why it is allowed to differ from production at QPSK: this
+// builds the table in level-index order (I axis outer, amplitude ascending),
+// which is exactly production's order for 16/64/256-QAM -- those three branches
+// are written as `for real in pam_gray: for imag in pam_gray` with pam_gray in
+// ascending amplitude. Production's bits_per_symbol == 2 branch instead lists a
+// hand-written table in Gray-LABEL order (-1-1j, -1+1j, +1+1j, +1-1j). The two
+// orders are a permutation of one another and the label -> point PAIRING is
+// identical, which is all any consumer here uses: qam_map looks symbols up by
+// label, and both soft demodulators sum over the whole candidate set. Nothing
+// in this repo indexes the table positionally against production; the pairing is
+// pinned order-free by tools/modem_common.py::check_production at m = 2.
 struct Qam {
   int m = -1;
   std::vector<dcplx> sym;      // [M]
@@ -108,7 +124,13 @@ double fold_axis(double x, double period) { return hpocl::cmod_axis(x, period); 
 }  // namespace
 
 int qam_bits_per_symbol(int M) {
+  // The four orders production's get_constellation accepts (it raises a
+  // ValueError for anything else), and the four the fp32 kernels reach through
+  // Runtime's dp_dims_ok (m even, 2..8). QPSK was missing here while both of
+  // those supported it, so the C++ reference -- the side chain_bench compares
+  // the kernels against -- could not serve the smallest constellation.
   switch (M) {
+    case 4:   return 2;
     case 16:  return 4;
     case 64:  return 6;
     case 256: return 8;

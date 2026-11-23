@@ -41,6 +41,15 @@ void rx_combiner(const dcplx* U, int Nr, const dcplx* V, int rows,
                  const double* sigma, int d, double snr, char strategy,
                  dcplx* Q, dcplx* R);
 
+// sqrt(p_constraint / ||P||_F^2) for an ALREADY-FORMED product P = Frf Fbb
+// [Nt x T]; 1.0 when the power collapses (production only normalizes above
+// 1e-12). The split from power_norm_scale exists so the GEMM that forms P can be
+// handed to a provider (ref/pipeline.h's GemmProvider -> kernels/wbb_apply.cl)
+// while the floor, the accumulation order and the square root stay defined
+// exactly once. Both accumulate i-then-t, so the split is bit-identical.
+double power_norm_from_product(const dcplx* P, int Nt, int T,
+                               double p_constraint);
+
 // sqrt(p_constraint / ||Frf Fbb||_F^2) for Frf [Nt x NRF] and Fbb [NRF x T];
 // 1.0 when the power collapses (production only normalizes above 1e-12).
 double power_norm_scale(const dcplx* Frf, int Nt, int NRF, const dcplx* Fbb,

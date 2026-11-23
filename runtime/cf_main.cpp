@@ -75,14 +75,40 @@ int main(int argc, char** argv) {
   // differ by up to 0.096 dB of tau (README's decision record), which shows up
   // as maxcl = 8.8e-2 / 9.6e-2 dB -- measured, on this device, and large enough
   // to fail the 5e-2 bound while every host-side column looks perfect.
-  std::string kopts = rt.device_fp64() ? "" : "-DHPOCL_FP32";
+  // threshold_cf.cl is fp32 BY DEFAULT and takes -DHPOCL_FP64 to opt into
+  // double, so the flag this bench passes is the opposite of what it used to be:
+  // an fp64-capable device now has to ASK for fp64. cl_tol below keys off the
+  // same test, which is what keeps the host tolerance and the kernel precision
+  // from disagreeing -- the failure mode that a "device capability" tolerance
+  // and an "explicit opt-in" kernel precision would otherwise create is a fp32
+  // kernel judged against a 1e-6 dB fp64 bound, i.e. a red gate with every
+  // host-side column perfect.
+  // HPOCL_CLOPTS WINS, exactly as in allprog_main.cpp / bench_main.cpp /
+  // datapath_main.cpp. This used to key off device_fp64() alone, which made the
+  // bench unrunnable on any fp64-capable device whose constant limit is the 64 KB
+  // spec minimum -- i.e. every NVIDIA GPU measured here (L4 and P40 both report
+  // 65 536 B): the fp64 deficit table is 128 000 B, and the build dies in the
+  // vendor toolchain with `ptxas error : File uses too much global constant data
+  // (0x1f720 bytes, 0x10000 max)` before a single kernel exists, so the PL
+  // configuration could not be gated on such a device at all.
+  const char* copts_env = getenv("HPOCL_CLOPTS");
+  std::string kopts = copts_env ? copts_env
+                                : (rt.device_fp64() ? "-DHPOCL_FP64" : "");
 #if !HPOCL_DEFICIT_TABLE
   kopts += " -DHPOCL_DEFICIT_TABLE=0";
 #endif
   if (!rt.load_program({"kernels/threshold_cf.cl"}, kopts.c_str())) return 2;
-  double cl_tol = rt.device_fp64() ? 1e-6 : 5e-2;
-  printf("[cf_bench] device: %s (fp64=%d, kernel opts '%s')\n", rt.device_name(),
-         (int)rt.device_fp64(), kopts.c_str());
+  // fp64 kernel: 1e-6 dB. fp32 kernel (the default, and the only thing the PL
+  // can build): 5e-2 dB, which the fp32 index arithmetic documented in
+  // dft_lookup() leaves 350x of margin inside.
+  // ... and the tolerance must key off the BUILD, not the device: with
+  // HPOCL_CLOPTS honoured, an fp64-capable device can be running the fp32 kernel,
+  // and judging that against the 1e-6 dB fp64 bound is the red-gate-with-perfect-
+  // host-columns failure the comment above describes.
+  const bool fp64_build = kopts.find("HPOCL_FP64") != std::string::npos;
+  double cl_tol = fp64_build ? 1e-6 : 5e-2;
+  printf("[cf_bench] device: %s (device fp64=%d, build fp64=%d, kernel opts '%s')\n",
+         rt.device_name(), (int)rt.device_fp64(), (int)fp64_build, kopts.c_str());
 
   // 'DFT1': tools/cf_ref.py stamps the format and the evaluator it was run with,
   // so a vectors file generated under the other HPOCL_DEFICIT_TABLE setting is
@@ -197,7 +223,7 @@ int main(int argc, char** argv) {
     //     = t^2 * 2e-9, i.e. 2.0e-6 nats at t = 32) stays 500x below the step
     //     being measured. At eps = 1e-6 drift and step would be the same size
     //     and the number would mean nothing.
-    double hnd = 0.0;
+    double hnd = 0.0, psid = 0.0;
     for (int e = 0; e < 2 && dft_thi > 0.0; ++e) {
       const double edge = e == 0 ? dft_tlo : dft_thi;
       const double eps = 1e-9, k = 2.0 * edge * edge * (M - 1) / 6.0;
@@ -241,6 +267,23 @@ int main(int argc, char** argv) {
       maxtau = fmax(maxtau, err_tau(r.tau_dB, tau_ref[c]));
       if (pyflag[c] == 0) maxcf = fmax(maxcf, fabs(r.tau_cf_dB - tcf[c]));
       ++ncomp;
+      // psid: the deployed ANALYTIC psi_du against the three-point central
+      // difference it replaced, at the root. Host-side, so it needs no device; it
+      // lives here because this loop already has the channel, the config and the
+      // root. Newton actually uses the analytic form, and psi_du_central is the
+      // one check on it whose correctness does not depend on the Lagrange basis
+      // derivatives being right -- tools/check_deficit_table.py gates those
+      // separately, and exactly (cubic reproduction to 3.27e-16 term-relative).
+      // Measured on the 79-channel host pool: worst 7.99e-08 relative for the
+      // analytic form against an INDEPENDENT central difference of psi_u, against
+      // 3.81e-05 for the three-point form, i.e. the replacement is 476x more
+      // accurate than what it replaced. The 1e-3 bound is set by the three-point
+      // form's own O(h^2) truncation at h = 1e-3, not by the analytic one.
+      {
+        const double an = psi_du(r.u_star, lc, cfg);
+        const double fd = psi_du_central(r.u_star, lc, cfg);
+        psid = fmax(psid, fabs(an - fd) / fmax(1e-300, fabs(fd)));
+      }
       // Deployed Newton budget (cfg.newton_iters, 20) against an 8-step run of
       // the SAME code path. This used to build a second CfConfig with
       // newton_iters = 20 and compare it against the default, which had also
@@ -291,8 +334,45 @@ int main(int argc, char** argv) {
                 cl_fl[c] == 4 ? "kernel" : "host", c, K, d, M);
         ++nfbm; ++fails; continue;
       }
+      // COVERAGE GAP, stated where someone will trip over it: this skip runs
+      // BEFORE the flag comparison below, so on a near-flat or fallback channel
+      // the kernel's flag is never compared against the host's. On this pool that
+      // is 8 of 8 channels in the M=64/d=2/K=4 config and 3 of 8 in M=16/d=2/K=4,
+      // i.e. the near-flat fallback -- the only code kernels/psi_scan.clh owns --
+      // has NO device-vs-host comparison anywhere in `make check`. The pool also
+      // contains 0 flag-1 channels of 40, so the fallback's root-finding half is
+      // not exercised here at all. tools/cf_scan_ab.py --device is that
+      // comparison: 46 degenerate / near-flat / below-grid spectra (16 flat, 24
+      // with 1-2 dead streams, 3 below the ln-D grid, 3 well-conditioned
+      // controls) through the fp32 kernel and the fp64 host. Two things it
+      // measured when it was added, both worth knowing before "fixing" either:
+      //   * the kernel is unchanged by the psi_scan.clh refactor -- 0 flag
+      //     mismatches and max|dtau| = 0.000e+00 dB against the pre-refactor
+      //     kernel on all 46, because PSI_SCAN_N = 161 is the grid the device
+      //     already had and (real)1e6/(real)1e-6 is exactly (real)1e12;
+      //   * one case DOES differ between the fp32 kernel and the fp64 host, and
+      //     did before the refactor too: zero2_M64_d2_UCD, where Psi's only
+      //     positive excursion peaks at +5.4e-5 -- above the fp64 dead band
+      //     (1e-6), 19x below the fp32 one (1e-3) -- so the host returns flag 1 /
+      //     tau = 40.50 dB and the kernel flag 2 / tau = +inf. That is the
+      //     precision-keyed PSI_BAND doing what it says, not a method divergence,
+      //     but it is a real PS/PL decision difference on a rank-deficient
+      //     spectrum, and README's "PSI_BAND 1e-6 -> 1e-3 changes tau by 0.0000
+      //     dB" is measured on shapes that do not include it.
       if (pyflag[c] || flat_ratio(lc, K, d, M) < 0.05) { ++nskip; continue; }
-      if (cl_fl[c] != r.flag) { ++nfbm; continue; }
+      // A kernel/host flag disagreement on a channel that got this far IS a
+      // failure, and this line used to count it without failing the bench. That
+      // was not a harmless shortcut: it is what let a completely wrong kernel
+      // answer print as "ALL PASS" -- with the marshalling bug described in
+      // Runtime::prog_fp64_, every one of the 8 channels in a config mismatched
+      // its flag, so every tau comparison was skipped, `cl` stayed at its initial
+      // 0.00e+00 and the gate reported a perfect score for a kernel that had
+      // returned 0.0 dB on every channel. Channels that legitimately differ are
+      // already excluded above (pyflag / flat_ratio) or belong in
+      // tools/cf_scan_ab.py --device, which is where the one known PS/PL flag
+      // difference (zero2_M64_d2_UCD, the precision-keyed PSI_BAND) is measured
+      // and reported instead of being silently tolerated.
+      if (cl_fl[c] != r.flag) { ++nfbm; ++fails; continue; }
       if (verb) printf("   ch%d cl tau_cf=%.6f cl_cf=%.6f tau=%.6f cl_tau=%.6f fb=%d\n",
                        c, r.tau_cf_dB, cl_cf[c], r.tau_dB, cl_tau[c], cl_fl[c]);
       maxcl = fmax(maxcl, err_tau(cl_tau[c], r.tau_dB));
@@ -336,14 +416,14 @@ int main(int argc, char** argv) {
     // Re-measure the column on the device after this change; the bound stays
     // 1e-4 dB, which the oracle-side 30-step root still justifies.
     bool ok = maxq < 1e-9 && maxcf < 1e-9 && maxtau < 1e-4 && nflag == 0 &&
-              maxcl < cl_tol && maxdep < 1.0 &&
+              maxcl < cl_tol && maxdep < 1.0 && psid < 1e-3 &&
               maxtab < 1e-9 && maxl4 < 1e-9 && hnd < 6e-3;
     if (!ok) ++fails;
     printf("cfg(M=%3d d=%d K=%d %s): quad=%.2e tab=%.2e l4=%.1e hnd=%.2e "
-           "cf=%.2e tau=%.2e cl=%.2e "
+           "cf=%.2e tau=%.2e cl=%.2e psid=%.2e "
            "roots=%d/%d fb=%d flat=%d skip=%d fbm=%d flagmis=%d dep=%.3f cf_only=%.1e %.0fus %s\n",
            M, d, K, var ? "UCD" : "GMD", maxq, maxtab, maxl4, hnd,
-           maxcf, maxtau, maxcl,
+           maxcf, maxtau, maxcl, psid,
            nroot, ncomp, nfb, nflat, nskip, nfbm, nflag, maxdep, maxcl_cf, us,
            ok ? "PASS" : "FAIL");
   }

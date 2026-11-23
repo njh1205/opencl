@@ -78,8 +78,7 @@ def select(gmi, eps):
 def cases():
     """Deliberately adversarial: exact table boundaries, one ulp either side,
     the eps slack, the whole special-value set, saturation and full outage."""
-    j = np.arange(1, 16)
-    exact = SE[1:16]
+    exact = SE[1:]                     # every real entry, index 0 is "out of range"
     c = []
     # 0: exactly on every table entry, no slack -> must select that entry
     c.append((exact.astype(np.float32), 0.0, "on-boundary eps=0"))
@@ -105,7 +104,6 @@ def cases():
     c.append((np.linspace(0.0, 6.0, 13).astype(np.float32), 1e-5, "staircase"))
     # 9: single stream (K=1, the smallest legal launch)
     c.append((np.array([2.4063], dtype=np.float32), 0.0, "K=1"))
-    _ = j
     return c
 
 

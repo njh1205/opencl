@@ -14,7 +14,6 @@
 // opencl/build/build_xclbin.sh. tools/check_capacity.py fails the build on
 // drift, so do not restate the value in prose here.
 //-----------------------------------------------------------------------------
-#include <vector>
 #include <cstddef>
 
 namespace hpocl {
@@ -95,9 +94,10 @@ struct CfResult {
   // method / status, the SAME encoding as flags[c] in kernels/threshold_cf.cl
   // and as the flag returned by tools/cf_ref.py tau_policy():
   //   0 = closed form (eq. cf) + Newton
-  //   1 = near-flat spectrum: geometric scan of Psi supplied the start point
-  //   2 = saturated: Psi keeps one sign over the whole scan, so the branch
-  //       ordering is uniform and tau is +-INFINITY (-inf = always THP,
+  //   1 = near-flat spectrum: the Psi grid scan whose one definition is
+  //       kernels/psi_scan.clh supplied the start point
+  //   2 = saturated: Psi never makes the scan's -band -> +band transition, so the
+  //       branch ordering is uniform and tau is +-INFINITY (-inf = always THP,
   //       +inf = always SVD). INFINITY, not HUGE_VAL, so std::isinf() is
   //       meaningful in cf_main / lmmse_main / pipeline.
   //   4 = configuration outside the compiled capacity (kCapMaxT/K/D, or M not a
@@ -145,10 +145,50 @@ void deficit_table_grid(double* t_lo, double* t_hi, int* n_points, int* n_M);
 // cancellation-free log-domain balance solved by Newton on PL
 double phi_u(double u, const double* lam /*K*d*/, const CfConfig& c);
 double phi_du(double u, const double* lam, const CfConfig& c);
-double psi_u(double u, const double* lam, const CfConfig& c);
 double ln_deficit_fin(double gamma, int M);
 double ln_deficit_mod(double gamma, int M);
-double psi_du(double u, const double* lam, const CfConfig& c);
+
+// Per-channel precompute for the Psi hot path. Every member is a function of
+// (lam, c) alone -- none of them depends on the Newton unknown u -- so
+// threshold_closed_form() fills this ONCE and its ~20 Newton steps, ~12 bracket
+// evaluations and the near-flat fallback's up to PSI_SCAN_N = 161 grid points
+// (it was 401) all reuse it. What it removes from the inner loop, per deficit
+// evaluation: the row-group scan of kDFT_M, the gamma = 4*u*lam/d2 division,
+// t_of()'s two square roots, the log(d) and (under GMD) the K*d logs + K exps of
+// g_k. Arrays are sized by the same host mirrors of the kernel's capacity
+// constants that psi_u/psi_du already guard on (kCapMaxT / kCapMaxK <-> MAXT /
+// MAXK in kernels/threshold_cf.cl), which tools/check_capacity.py keeps in step.
+struct PsiPre {
+  int    nf;                       // K*d, or -1 if the config is out of capacity
+  int    K, d, M;
+  int    mi;                       // deficit_table_index(M), -1 if untabulated
+  double k3;                       // 3/(M-1): t^2 = gamma * k3
+  double d2;                       // 6/(M-1) = delta^2, so rho = 4u/d2
+  double eta;                      // eta_factor(d, M)
+  double log_d;                    // log(d), the THP stream-count term
+  ThpVariant variant;
+  double cr[kCapMaxT];             // 2*lam_i: t_i^2 = u * cr_i, no sqrt, no div
+  double lg_gmd[kCapMaxK];         // sum_i log(max(lam_i,1e-12)) per user (GMD g_k)
+};
+void psi_precompute(const double* lam, const CfConfig& c, PsiPre* w);
+// Passing w = nullptr (the default, and what every caller outside
+// threshold_closed_form uses) builds the precompute inside the call, so the two
+// spellings cannot diverge -- there is one psi_u, not a fast one and a public one.
+double psi_u(double u, const double* lam, const CfConfig& c,
+             const PsiPre* w = nullptr);
+// Deployed dPsi/du: per-term log-derivatives taken ANALYTICALLY (the interpolant's
+// own basis derivative on the table branch, the closed form of d lnQ_asym/d ln t
+// on the tail), so one Psi fill per call instead of three. See psi_du's comment
+// for the chain rule and for why the UCD feedback term is free.
+double psi_du(double u, const double* lam, const CfConfig& c,
+              const PsiPre* w = nullptr);
+// The three-point central difference psi_du replaced. Kept compiled in and
+// exported on purpose: it is the cross-check that stops the analytic derivative
+// from drifting silently, and it is the only form whose correctness does not
+// depend on the Lagrange basis derivatives being right. runtime/cf_main.cpp
+// compares the two at the root; do not delete it to save the code.
+double psi_du_central(double u, const double* lam, const CfConfig& c,
+                      const PsiPre* w = nullptr);
 
 // LMMSE deployable scalar eps_s = tr(Re)/tr(Rh) from prior spectrum + pilot nv
 double lmmse_eps_s(const double* eig_prior, int n, double nv);

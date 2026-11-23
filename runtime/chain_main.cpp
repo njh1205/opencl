@@ -6,9 +6,15 @@
 // Per case: bits --QAM--> s0 --(per-user THP)--> sfull --Frf Fbb--> x
 //   --H_k + n_k--> y_k --Q_k^H (/ diagb)--> z --(modulo)--> zf
 //   --soft LLR--> gmi / ber. SVD branch demodulates z in parallel; GMD-THP
-//   folds z and uses the periodic-replica soft demodulator; MMSE-UCD keeps the
-//   per-stream noise n0*||Q_j||^2 (w_ucd is pre-normalised) and, having no
-//   scalar-n0 kernel path, is validated by the C++/oracle pair only.
+//   folds z and uses the periodic-replica soft demodulator; MMSE-UCD folds z as
+//   well but with a PER-STREAM noise floor n0*||Q_j||^2, because w_ucd has unit
+//   GAIN (Q^H G has a unit diagonal, so z needs no diag_b divide) without unit
+//   NORM -- measured on the UCD case below: ||Q_k col j||^2 = 0.085..0.093, an
+//   order of magnitude away from 1. The demodulator kernels take one scalar n0,
+//   so this bench launches them once per stream with that stream's own floor:
+//   the same kernel, the same math the fp64 branch uses, T launches instead of
+//   one. All three strategies therefore run on the device now; UCD used to be
+//   validated by the C++/oracle pair only.
 //
 // The datapath stages share the oracle control plane read from the bin, so the
 // fp64-vs-oracle stage comparison is exact; schedule() runs separately and the
@@ -27,11 +33,9 @@
 #include <complex>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <string>
 #include <vector>
 #include "hpocl_modulo.h"   // hpocl::cmod: host twin of kernels/cplx.clh
+#include "hpocl_vecio.h"    // the shared bounds-checked reader for tools/*.bin
 #include "hpocl_runtime.h"
 #include "pipeline.h"
 #include "modem.h"
@@ -43,27 +47,6 @@ using f2 = cplx;   // host type of the device float2: complex<float>, so the
                    // Runtime wrappers take these buffers directly
 
 namespace {
-
-struct Reader {                               // little-endian, bounds-checked
-  std::vector<uint8_t> buf; size_t o = 0; bool bad = false;
-  explicit Reader(const char* path) {
-    std::ifstream f(path, std::ios::binary);
-    buf.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  }
-  const uint8_t* take(size_t n) {
-    if (o + n > buf.size()) { bad = true; return buf.data(); }
-    const uint8_t* p = buf.data() + o; o += n; return p;
-  }
-  int i() { int v = 0; memcpy(&v, take(4), 4); return v; }
-  double d() { double v = 0; memcpy(&v, take(8), 8); return v; }
-  void u8(std::vector<uint8_t>& v) { memcpy(v.data(), take(v.size()), v.size()); }
-  void cx(std::vector<cd>& v) {
-    const uint8_t* p = take(16 * v.size());
-    for (cd& e : v) { double re, im; memcpy(&re, p, 8); memcpy(&im, p + 8, 8);
-                      p += 16; e = cd(re, im); }
-  }
-  void re(std::vector<double>& v) { memcpy(v.data(), take(8 * v.size()), 8 * v.size()); }
-};
 
 f2 pack_cd(cd v) { return f2((float)v.real(), (float)v.imag()); }
 std::vector<f2> pack(const std::vector<cd>& v) {
@@ -128,7 +111,13 @@ double ber_from_llr(const float* llr, const uint8_t* bits, size_t n) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  Reader rd(argc > 1 ? argv[1] : "build/chain_vectors.bin");
+  const char* vec = argc > 1 ? argv[1] : "build/chain_vectors.bin";
+  hpocl::VecReader rd(vec);
+  if (!rd.ok()) {
+    fprintf(stderr, "[chain] %s (run: python3 tools/chain_ref.py)\n",
+            rd.error().c_str());
+    return 2;
+  }
   Runtime rt;
   const char* dev = argc > 2 ? argv[2] : "cpu";
   // One program from both sources: Runtime::build concatenates them, which is
@@ -149,33 +138,91 @@ int main(int argc, char** argv) {
       return 2;
     }
   const int grp = 2;                             // bits per demod work-item
+  // Replica ring count of the folded demodulator: bicm_metrics.
+  // enumerate_thp_symbol_replicas(m, replica_radius) with the radius
+  // tools/chain_ref.py uses (RADIUS = 2, i.e. (2*2+1)^2 = 25 shifts per point).
+  // Must stay equal to the oracle's, or the two candidate sets differ.
+  const int kRadius = 2;
 
   int ncase = rd.i(), fails = 0;
   for (int ci = 0; ci < ncase; ++ci) {
     PipeCfg c;
     c.K = rd.i(); c.Nt = rd.i(); c.Nr = rd.i(); c.NRF = rd.i(); c.d = rd.i();
     c.M = rd.i(); c.variant = rd.i(); int nul = rd.i(); int nsym = rd.i();
-    c.gamma_tot_dB = rd.d(); double e_tau = rd.d(); double e_ps = rd.d();
+    c.gamma_tot_dB = rd.f(); double e_tau = rd.f(); double e_ps = rd.f();
     int eMode = rd.i();
     const int K = c.K, Nt = c.Nt, Nr = c.Nr, NRF = c.NRF, d = c.d, T = K * d;
     const int m = qam_bits_per_symbol(c.M);
+    // Pre-flight, before a single allocation: every vector below is sized by the
+    // header just read, and all five vector files are argv[1], so pointing this
+    // bench at the wrong one reads a garbage dimension. VecReader bounds-checks
+    // each *read*, which is too late -- the allocation has already been asked
+    // for gigabytes (measured: 18 s of thrashing, then SIGKILL/137 with no
+    // message). So sanity-bound the header, then ask the reader whether the file
+    // even holds this case's bytes; take() validates without consuming.
+    if (K < 1 || K > 64 || Nt < 1 || Nt > 4096 || Nr < 1 || Nr > 4096 ||
+        NRF < 1 || NRF > 4096 || d < 1 || d > 64 || nsym < 1 || nsym > 65536 ||
+        m < 0 || c.variant < 0 || c.variant > 1 || eMode < 0 || eMode > 1) {
+      fprintf(stderr, "[chain] case%d: implausible header K=%d Nt=%d Nr=%d "
+              "NRF=%d d=%d nsym=%d M=%d variant=%d mode=%d -- wrong vector "
+              "file? (run: python3 tools/chain_ref.py)\n", ci, K, Nt, Nr, NRF,
+              d, nsym, c.M, c.variant, eMode);
+      return 2;
+    }
     const double snr_ps = std::pow(10.0, c.gamma_tot_dB / 10.0) / T;
     const double n0 = 1.0 / snr_ps;
     const double period = qam_modulo_period(c.M);
     auto rev = [&](int i) { return d - 1 - i; };       // decomp_main encoding
 
-    std::vector<uint8_t> bits((size_t)T * nsym * m);
-    std::vector<cd> eH((size_t)K * Nr * Nt), eFrf((size_t)Nt * NRF),
-        eFbb((size_t)NRF * T), eQ((size_t)K * Nr * d), eR((size_t)K * d * d),
-        ediagb((size_t)K * d), eB((size_t)K * d * d), en((size_t)K * Nr * nsym),
-        es0((size_t)T * nsym), esf((size_t)T * nsym), ex((size_t)Nt * nsym),
-        ey((size_t)K * Nr * nsym), ez((size_t)T * nsym), ezf((size_t)T * nsym);
-    std::vector<double> ellr((size_t)T * nsym * m), egmi(T), eber(T);
-    rd.u8(bits); rd.cx(eH); rd.cx(eFrf); rd.cx(eFbb); rd.cx(eQ); rd.cx(eR);
+    // Element count of every field this case reads, in the on-disk order of
+    // tools/chain_ref.py::field_list. Named once and used BOTH for the
+    // pre-flight byte count and for the allocations below, so the count cannot
+    // drift from the vectors (a hand-written total did exactly that, and
+    // rejected a valid case by 256 bytes).
+    const size_t n_bits = (size_t)T * nsym * m;   // uint8      transmitted bits
+    const size_t n_H    = (size_t)K * Nr * Nt;    // complex128 per-user channel
+    const size_t n_Frf  = (size_t)Nt * NRF;       // complex128 RF precoder
+    const size_t n_Fbb  = (size_t)NRF * T;        // complex128 digital precoder
+    const size_t n_Q    = (size_t)K * Nr * d;     // complex128 combiners
+    const size_t n_R    = (size_t)K * d * d;      // complex128 upper factors
+    const size_t n_db   = (size_t)K * d;          // complex128 diag_b
+    const size_t n_B    = (size_t)K * d * d;      // complex128 THP feedback
+    const size_t n_n    = (size_t)K * Nr * nsym;  // complex128 noise, per user
+    const size_t n_s    = (size_t)T * nsym;       // complex128 s0/sfull/z/zf
+    const size_t n_x    = (size_t)Nt * nsym;      // complex128 transmit block
+    const size_t n_y    = (size_t)K * Nr * nsym;  // complex128 received (= n_n)
+    const size_t n_llr  = (size_t)T * nsym * m;   // float64    LLRs
+    // 16 B per complex128, 8 B per float64, 1 B per bit; s0/sfull/z/zf share n_s.
+    const size_t need = n_bits
+        + 16 * (n_H + n_Frf + n_Fbb + n_Q + n_R + n_db + n_B + n_n + n_y
+                + 4 * n_s + n_x)
+        + 8 * (n_llr + 2 * (size_t)T);
+    if (!rd.take(need, "chain case")) return 2;
+
+    std::vector<uint8_t> bits(n_bits);
+    std::vector<cd> eH(n_H), eFrf(n_Frf), eFbb(n_Fbb), eQ(n_Q), eR(n_R),
+        ediagb(n_db), eB(n_B), en(n_n), es0(n_s), esf(n_s), ex(n_x),
+        ey(n_y), ez(n_s), ezf(n_s);
+    std::vector<double> ellr(n_llr), egmi(T), eber(T);
+    rd.by(bits); rd.cx(eH); rd.cx(eFrf); rd.cx(eFbb); rd.cx(eQ); rd.cx(eR);
     rd.cx(ediagb); rd.cx(eB); rd.cx(en); rd.cx(es0); rd.cx(esf); rd.cx(ex);
     rd.cx(ey); rd.cx(ez); rd.cx(ezf); rd.re(ellr); rd.re(egmi); rd.re(eber);
-    if (rd.bad) { fprintf(stderr, "[chain] truncated vectors file\n"); return 2; }
-    const bool ucd = eMode == 1 && c.variant == 1;    // no scalar-n0 kernel path
+    if (rd.bad()) return 2;              // VecReader already printed the offset
+    const bool ucd = eMode == 1 && c.variant == 1;   // per-stream noise floor
+    // ||Q_k col j||^2, the MMSE-UCD noise gain of stream st = k*d + j. Computed
+    // once here because the fp64 reference chain and the fp32 kernel chain must
+    // demodulate with the SAME floor -- two independent copies of this sum would
+    // be two chances to disagree. Trivially 1 for a unit-norm combiner; it is
+    // not (see the header), and for the SVD/GMD branches it is not used at all
+    // because there z is divided by diag_b and the floor is the scalar n0.
+    std::vector<double> qn(T, 1.0);
+    if (ucd)
+      for (int k = 0; k < K; ++k)
+        for (int j = 0; j < d; ++j) {
+          double q = 0;
+          for (int r = 0; r < Nr; ++r) q += std::norm(eQ[((size_t)k * Nr + r) * d + j]);
+          qn[(size_t)k * d + j] = q;
+        }
 
     // ---- control plane: schedule() vs oracle fields, gauge+scale free ----
     // Both schedule() and the bin store Fbb as [NRF][T] with the users side by
@@ -280,16 +327,10 @@ int main(int argc, char** argv) {
       softdemod_parallel(z.data(), n0, c.M, llr.data(), T * nsym);
     } else if (c.variant == 0) {
       softdemod_folded(zf.data(), n0, c.M, period, llr.data(), T * nsym);
-    } else {                                          // UCD: per-stream noise
-      for (int k = 0; k < K; ++k)
-        for (int j = 0; j < d; ++j) {
-          double qn = 0;
-          for (int r = 0; r < Nr; ++r)
-            qn += std::norm(eQ[((size_t)k * Nr + r) * d + j]);
-          int st = k * d + j;
-          softdemod_folded(zf.data() + (size_t)st * nsym, n0 * qn, c.M, period,
-                           llr.data() + (size_t)st * nsym * m, nsym);
-        }
+    } else {                       // UCD: one launch per stream, its own floor
+      for (int st = 0; st < T; ++st)
+        softdemod_folded(zf.data() + (size_t)st * nsym, n0 * qn[st], c.M, period,
+                         llr.data() + (size_t)st * nsym * m, nsym);
     }
     for (int st = 0; st < T; ++st) {
       gmi[st] = gmi_from_llr(llr.data() + (size_t)st * nsym * m,
@@ -311,12 +352,12 @@ int main(int argc, char** argv) {
                e_z < 1e-8 && e_zf < 1e-8 && e_llr < 1e-9 && e_gmi < 2e-3 &&
                e_ber < 2e-3;
 
-    // ---- fp32 kernel chain (SVD and GMD-THP; UCD is C++/oracle only) -----
+    // ---- fp32 kernel chain (all three strategies) -----------------------
     double s_cl = 0, x_cl = 0, y_cl = 0, z_cl = 0, zf_cl = 0, llr_cl = 0,
            gmi_cl = 0, ber_cl = 0, thp32 = -1;
     std::vector<f2> s0cl((size_t)T * nsym), sfcl((size_t)T * nsym);
     std::vector<float> gllr((size_t)T * nsym * m), ggmi(T);
-    if (!ucd) {
+    {
       std::vector<f2> cFrf = pack(eFrf), cFbb = pack(eFbb),
                       cdiag = pack(ediagb), cQ = pack(eQ);
       rt.qam_map(bits.data(), m, T * nsym, s0cl.data());
@@ -374,17 +415,26 @@ int main(int argc, char** argv) {
         std::vector<f2> yk(Nr * nsym), zk(d * nsym);
         rt.channel_apply(Hk.data(), Nr, Nt, xcl.data(), nsym, nk.data(),
                          yk.data());
-        rt.rx_combine(Qk.data(), 1, Nr, d, yk.data(), nsym, dk.data(),
-                      zk.data());
+        // UCD's z is the raw combiner output (its gain is already 1, and
+        // dividing by diag_b would scale the constellation away from the
+        // candidates the demodulator scores) -- thp_receive_equalized with
+        // diag_b = None, matching tools/chain_ref.py's `mode == 0 or variant == 0`.
+        rt.rx_combine(Qk.data(), 1, Nr, d, yk.data(), nsym,
+                      ucd ? nullptr : dk.data(), zk.data());
         for (int i = 0; i < Nr * nsym; ++i) ycl[(size_t)k * Nr * nsym + i] = yk[i];
         for (int i = 0; i < d * nsym; ++i) zcl[(size_t)k * d * nsym + i] = zk[i];
       }
       rt.modulo_fold(zcl.data(), T * nsym, (float)period, zfcl.data());
-      if (eMode == 1)                                // folded branch
-        rt.softdemod_folded(zfcl.data(), T * nsym, m, grp, 2, (float)period,
-                            (float)n0, gllr.data());
-      else                                           // parallel branch
+      if (eMode == 0)                                // parallel branch
         rt.softdemod_llr(zcl.data(), T * nsym, m, grp, (float)n0, gllr.data());
+      else if (!ucd)                                 // GMD-THP: one scalar floor
+        rt.softdemod_folded(zfcl.data(), T * nsym, m, grp, kRadius,
+                            (float)period, (float)n0, gllr.data());
+      else                       // MMSE-UCD: per-stream floor, one launch each
+        for (int st = 0; st < T; ++st)
+          rt.softdemod_folded(zfcl.data() + (size_t)st * nsym, nsym, m, grp,
+                              kRadius, (float)period, (float)(n0 * qn[st]),
+                              gllr.data() + (size_t)st * nsym * m);
       rt.gmi(gllr.data(), bits.data(), m, nsym, T, ggmi.data());
       // kernel vs fp64 C++ reference (same control plane, fp32 rounding)
       s_cl = err_c(sfcl, sf);
@@ -400,6 +450,12 @@ int main(int argc, char** argv) {
             bits.data() + (size_t)st * nsym * m, (size_t)nsym * m) - ber[st]));
     }
 
+    // The folded branch carries the looser 3e-3 because it sums (2r+1)^2*M =
+    // 1600 candidates per bit instead of M = 64, so both the subset-minimum
+    // search and the exp() accumulation run ~25x longer in fp32. These are the
+    // pre-existing tolerances, not ones widened to fit the newly device-run UCD
+    // case: that case measures sf 8e-08, x 2e-07, y 2e-06, z 6e-07, zf 7e-07,
+    // llr 2e-04, gmi 2e-07, ber 0e+00, thp32 0e+00 -- inside every one of them.
     double llr_tol = eMode ? 3e-3 : 1e-3;            // folded runs 25x candidates
     // thp32 < 0 means "not computed" (SVD branch / no THP feedback this case).
     // When computed it is now a real gate: the fp32 kernel feedback must agree
@@ -407,9 +463,9 @@ int main(int argc, char** argv) {
     // chain. It was printed-but-ungated before, and was being fed tau =
     // sqrt(period), so it could not have passed had anyone gated it.
     bool ok = ctrl && ref && (thp32 < 0.0 || thp32 < 2e-3) &&
-              (ucd || (s_cl < 2e-3 && x_cl < 2e-3 && y_cl < 2e-3 &&
-                       z_cl < 2e-3 && zf_cl < 2e-3 && llr_cl < llr_tol &&
-                       gmi_cl < 2e-3 && ber_cl < 2e-3));
+              s_cl < 2e-3 && x_cl < 2e-3 && y_cl < 2e-3 &&
+              z_cl < 2e-3 && zf_cl < 2e-3 && llr_cl < llr_tol &&
+              gmi_cl < 2e-3 && ber_cl < 2e-3;
     fails += !ok;
     double og = 0, ob = 0;
     for (int i = 0; i < T; ++i) { og += egmi[i]; ob += eber[i]; }
@@ -424,7 +480,7 @@ int main(int argc, char** argv) {
            s_cl, x_cl, y_cl, z_cl, zf_cl, llr_cl, gmi_cl, ber_cl, thp32,
            og / T, ob / T, ok ? "PASS" : "FAIL");
   }
-  if (rd.o != rd.buf.size()) { fprintf(stderr, "[chain] vector file size mismatch\n"); ++fails; }
+  if (!rd.expect_done("chain_bench")) ++fails;   // contract drift vs the oracle
   printf(fails ? "[chain_bench] FAIL\n" : "[chain_bench] ALL PASS\n");
   return fails ? 1 : 0;
 }

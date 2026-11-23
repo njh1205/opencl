@@ -70,29 +70,53 @@ bool Runtime::acquire_kernels() {
   return true;
 }
 
-Runtime::~Runtime() {
-  if (ev_) clReleaseEvent(ev_);
-  // TransformerPredictor borrows these handles without owning them, so the map
-  // must be emptied here to make a use-after-free impossible rather than
-  // merely unlikely.
+void Runtime::release_program() {
+  // TransformerPredictor borrows these handles without owning them, so release
+  // kernels before the program on every reload, not only at destruction.
   for (auto& kv : kernels_) clReleaseKernel(kv.second);
   kernels_.clear();
   if (prog_) clReleaseProgram(prog_);
-  if (q_)    clReleaseCommandQueue(q_);
-  if (ctx_)  clReleaseContext(ctx_);
+  prog_ = nullptr;
+  prog_fp64_ = false;
 }
 
+void Runtime::reset() {
+  if (ev_) clReleaseEvent(ev_);
+  ev_ = nullptr;
+  release_program();
+  if (q_) clReleaseCommandQueue(q_);
+  q_ = nullptr;
+  if (ctx_) clReleaseContext(ctx_);
+  ctx_ = nullptr;
+  dev_ = nullptr;
+  dev_name_.clear();
+  dev_fp64_ = false;
+}
+
+Runtime::~Runtime() { reset(); }
+
 bool Runtime::init(const char* pref) {
+  // Reinitialisation is supported for device-policy retries. Drop the complete
+  // old ownership graph first so no stale kernels can outlive their program.
+  reset();
+  const char* preference = pref ? pref : "cpu";
   cl_uint nplat = 0;
-  if (clGetPlatformIDs(0, nullptr, &nplat) != CL_SUCCESS || !nplat) return false;
+  cl_int err = clGetPlatformIDs(0, nullptr, &nplat);
+  if (err != CL_SUCCESS || !nplat) {
+    fprintf(stderr, "[hpocl] clGetPlatformIDs failed (%d)\n", err);
+    return false;
+  }
   std::vector<cl_platform_id> plats(nplat);
-  clGetPlatformIDs(nplat, plats.data(), nullptr);
+  err = clGetPlatformIDs(nplat, plats.data(), nullptr);
+  if (err != CL_SUCCESS) {
+    fprintf(stderr, "[hpocl] clGetPlatformIDs enumeration failed (%d)\n", err);
+    return false;
+  }
 
   cl_device_type want = CL_DEVICE_TYPE_CPU;
-  if (!strcmp(pref, "gpu")) want = CL_DEVICE_TYPE_GPU;
-  if (!strcmp(pref, "acc")) want = CL_DEVICE_TYPE_ACCELERATOR;
+  if (!strcmp(preference, "gpu")) want = CL_DEVICE_TYPE_GPU;
+  if (!strcmp(preference, "acc")) want = CL_DEVICE_TYPE_ACCELERATOR;
 
-  cl_int err = CL_SUCCESS;
   bool found = false;
   for (cl_uint p = 0; p < nplat && !found; ++p) {
     if (clGetDeviceIDs(plats[p], want, 1, &dev_, nullptr) == CL_SUCCESS)
@@ -104,12 +128,38 @@ bool Runtime::init(const char* pref) {
         found = true;
     }
   }
-  if (!found) return false;
+  if (!found) {
+    fprintf(stderr, "[hpocl] no OpenCL device available for preference '%s'\n",
+            preference);
+    return false;
+  }
 
   ctx_ = clCreateContext(nullptr, 1, &dev_, nullptr, nullptr, &err);
-  if (err != CL_SUCCESS) return false;
+  if (err != CL_SUCCESS) {
+    fprintf(stderr, "[hpocl] clCreateContext failed (%d)\n", err);
+    reset();
+    return false;
+  }
+  // clCreateCommandQueue is OpenCL 1.2 and DEPRECATED from 2.0 on, where the
+  // replacement takes a property list. Which one exists depends on the headers the
+  // target ships, not on us: XRT embedded has historically been 1.2, newer Vitis
+  // and every desktop ICD are 2.0+, and a bare call here is the one g++ warning
+  // this file produces (g++ 10.5, Ubuntu 20.04, -Wall -Wextra: 26 translation
+  // units, 1 warning, 0 errors). Profiling must stay on either way -- last_us() is
+  // the kernel-event column every timing in the README quotes, and the wall column
+  // on this dev host is 200x larger than the event it wraps.
+#ifdef CL_VERSION_2_0
+  const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES,
+                                       CL_QUEUE_PROFILING_ENABLE, 0};
+  q_ = clCreateCommandQueueWithProperties(ctx_, dev_, props, &err);
+#else
   q_ = clCreateCommandQueue(ctx_, dev_, CL_QUEUE_PROFILING_ENABLE, &err);
-  if (err != CL_SUCCESS) return false;
+#endif
+  if (err != CL_SUCCESS) {
+    fprintf(stderr, "[hpocl] command-queue creation failed (%d)\n", err);
+    reset();
+    return false;
+  }
 
   char name[256] = {0};
   clGetDeviceInfo(dev_, CL_DEVICE_NAME, sizeof(name), name, nullptr);
@@ -119,61 +169,105 @@ bool Runtime::init(const char* pref) {
   // HPOCL_FP32=1 forces the single-precision host marshalling even if the
   // device claims fp64 (xclbins are compiled fp32 for PL).
   dev_fp64_ = (fp64 != 0) && getenv("HPOCL_FP32") == nullptr;
-  if (verbose_) printf("[hpocl] device: %s (pref=%s)\n", dev_name_.c_str(), pref);
+  if (verbose_) printf("[hpocl] device: %s (pref=%s)\n", dev_name_.c_str(), preference);
   return true;
 }
 
 bool Runtime::build(const std::vector<std::string>& files,
                     const char* extra_opts) {
+  if (!ctx_ || !dev_) {
+    fprintf(stderr, "[hpocl] build requested before successful init()\n");
+    return false;
+  }
+  if (files.empty()) {
+    fprintf(stderr, "[hpocl] build requested with no kernel sources\n");
+    return false;
+  }
+  // A new build replaces the active program; clear stale kernel handles first.
+  release_program();
   std::vector<std::string> srcs;
   std::vector<const char*> strs;
   std::vector<size_t> lens;
-  for (auto& f : files) {
+  for (const auto& f : files) {
     std::string src = read_cl_source(f);   // inlines #include "x.clh"
-    if (src.empty()) { fprintf(stderr, "[hpocl] missing kernel source %s\n", f.c_str()); return false; }
-    srcs.push_back(src);
+    if (src.empty()) {
+      fprintf(stderr, "[hpocl] missing kernel source %s\n", f.c_str());
+      return false;
+    }
+    srcs.push_back(std::move(src));
   }
   for (auto& s : srcs) { strs.push_back(s.c_str()); lens.push_back(s.size()); }
 
   cl_int err = CL_SUCCESS;
   prog_ = clCreateProgramWithSource(ctx_, (cl_uint)strs.size(), strs.data(),
                                     lens.data(), &err);
-  if (err != CL_SUCCESS) return false;
-  std::string opts = "-cl-std=CL1.2 -cl-mad-enable";
-  if (extra_opts) { opts += " "; opts += extra_opts; }
-  err = clBuildProgram(prog_, 1, &dev_, opts.c_str(), nullptr, nullptr);
   if (err != CL_SUCCESS) {
-    char log[8192];
-    clGetProgramBuildInfo(prog_, dev_, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
-    fprintf(stderr, "[hpocl] build failed:\n%s\n", log);
+    fprintf(stderr, "[hpocl] clCreateProgramWithSource failed (%d)\n", err);
+    prog_ = nullptr;
     return false;
   }
-  return acquire_kernels();
+  std::string opts = "-cl-std=CL1.2 -cl-mad-enable";
+  if (extra_opts) { opts += " "; opts += extra_opts; }
+  // The precision this program will have, recorded from the options actually
+  // passed -- NOT from what the device supports. kernels/threshold_cf.cl is fp32
+  // by default and takes -DHPOCL_FP64 to opt in, so "the device can do fp64" says
+  // nothing about what got compiled; the wrappers that marshal `real`-typed
+  // buffers (threshold_cf) must agree with the build or they read and write the
+  // wrong width. HPOCL_FP32 in the environment still wins, matching dev_fp64_'s
+  // existing override, so one knob forces both halves.
+  prog_fp64_ = opts.find("HPOCL_FP64") != std::string::npos &&
+               getenv("HPOCL_FP32") == nullptr;
+  if (prog_fp64_ && !dev_fp64_)
+    fprintf(stderr, "[hpocl] warning: -DHPOCL_FP64 was requested but %s reports "
+            "no CL_DEVICE_DOUBLE_FP_CONFIG -- the build or clCreateKernel will "
+            "fail (on Apple's Metal-backed OpenCL it fails as "
+            "'newComputePipelineState failed', which does not say why)\n",
+            dev_name_.c_str());
+  err = clBuildProgram(prog_, 1, &dev_, opts.c_str(), nullptr, nullptr);
+  if (err != CL_SUCCESS) {
+    char log[8192] = {0};
+    clGetProgramBuildInfo(prog_, dev_, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+    fprintf(stderr, "[hpocl] source build failed (%d):\n%s\n", err, log);
+    release_program();
+    return false;
+  }
+  if (acquire_kernels()) return true;
+  release_program();
+  return false;
 }
 
 cl_mem Runtime::mkbuf(const void* host, size_t bytes, cl_mem_flags extra) {
   cl_int err = CL_SUCCESS;
   cl_mem b = clCreateBuffer(ctx_, extra | (host ? CL_MEM_COPY_HOST_PTR : 0),
                             bytes, const_cast<void*>(host), &err);
+  if (err != CL_SUCCESS)
+    fprintf(stderr, "[hpocl] clCreateBuffer(%zu bytes) failed (%d)\n", bytes, err);
   return err == CL_SUCCESS ? b : nullptr;
 }
 void Runtime::rdbuf(cl_mem b, void* host, size_t bytes) {
-  clEnqueueReadBuffer(q_, b, CL_TRUE, 0, bytes, host, 0, nullptr, nullptr);
+  if (!b || !host) {
+    fprintf(stderr, "[hpocl] refusing read from a null OpenCL buffer or into a null host pointer\n");
+    return;
+  }
+  const cl_int err = clEnqueueReadBuffer(q_, b, CL_TRUE, 0, bytes, host, 0, nullptr, nullptr);
+  if (err != CL_SUCCESS)
+    fprintf(stderr, "[hpocl] clEnqueueReadBuffer(%zu bytes) failed (%d)\n", bytes, err);
 }
 bool Runtime::ndrange(cl_kernel k, cl_uint dims, const size_t* g, const size_t* l) {
   if (ev_) { clReleaseEvent(ev_); ev_ = nullptr; }
   cl_int err = clEnqueueNDRangeKernel(q_, k, dims, nullptr, g, l, 0, nullptr, &ev_);
-  clFinish(q_);
   // CL_INVALID_WORK_GROUP_SIZE / CL_OUT_OF_RESOURCES mean nothing ran at all.
   // Say so, with the kernel name and the shape: a failed launch otherwise looks
-  // exactly like a successful one that produced zeros.
+  // exactly like a successful one that produced zeros. clFinish() is checked as
+  // well: asynchronous device-side failures are reported there by several ICDs.
+  if (err == CL_SUCCESS) err = clFinish(q_);
   if (err != CL_SUCCESS) {
     const char* name = "?";
     for (const auto& kv : kernels_)
       if (kv.second == k) { name = kv.first.c_str(); break; }
-    fprintf(stderr, "[hpocl] %s: clEnqueueNDRangeKernel -> %d (global", name, err);
+    fprintf(stderr, "[hpocl] %s: OpenCL launch/finish -> %d (global", name, err);
     for (cl_uint i = 0; i < dims; ++i) fprintf(stderr, " %zu", g[i]);
-    fprintf(stderr, ") -- the kernel did NOT run, outputs NOT written\n");
+    fprintf(stderr, ") -- the kernel did NOT complete; outputs are not valid\n");
     return false;
   }
   return true;
@@ -181,26 +275,54 @@ bool Runtime::ndrange(cl_kernel k, cl_uint dims, const size_t* g, const size_t* 
 double Runtime::last_us() const {
   if (!ev_) return 0.0;
   cl_ulong t0 = 0, t1 = 0;
-  clGetEventProfilingInfo(ev_, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr);
-  clGetEventProfilingInfo(ev_, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, nullptr);
+  if (clGetEventProfilingInfo(ev_, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr) != CL_SUCCESS ||
+      clGetEventProfilingInfo(ev_, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, nullptr) != CL_SUCCESS ||
+      t1 < t0)
+    return 0.0;
   return (double)(t1 - t0) / 1e3;
 }
 
 bool Runtime::load_xclbin(const std::string& path) {
+  if (!ctx_ || !dev_) {
+    fprintf(stderr, "[hpocl] load_xclbin requested before successful init()\n");
+    return false;
+  }
+  // A precompiled binary carries no queryable precision, so this asserts the only
+  // one the PL can have: fp32. The ZU49DR's DSP48E2 has no floating point at all,
+  // build_xclbin.sh passes -DHPOCL_FP32, and kernels/threshold_cf.cl defaults to
+  // fp32 -- three independent reasons. If an fp64 xclbin ever exists this has to
+  // become a parameter, and the wrappers that marshal `real` (threshold_cf) are
+  // what would silently break: see prog_fp64_'s comment for the measured failure.
+  release_program();
   std::ifstream f(path, std::ios::binary);
   if (!f) { fprintf(stderr, "[hpocl] missing xclbin %s\n", path.c_str()); return false; }
   std::vector<char> blob((std::istreambuf_iterator<char>(f)), {});
-  const unsigned char* bp = (const unsigned char*)blob.data();
+  if (blob.empty()) { fprintf(stderr, "[hpocl] xclbin %s is empty\n", path.c_str()); return false; }
+  const unsigned char* bp = reinterpret_cast<const unsigned char*>(blob.data());
   size_t bl = blob.size();
   cl_int bin_status = CL_SUCCESS, err = CL_SUCCESS;
-  cl_program prog = clCreateProgramWithBinary(ctx_, 1, &dev_, &bl, &bp,
-                                              &bin_status, &err);
+  prog_ = clCreateProgramWithBinary(ctx_, 1, &dev_, &bl, &bp,
+                                    &bin_status, &err);
   if (err != CL_SUCCESS || bin_status != CL_SUCCESS) {
     fprintf(stderr, "[hpocl] clCreateProgramWithBinary failed (%d/%d)\n", err, bin_status);
+    release_program();
     return false;
   }
-  prog_ = prog;
-  return acquire_kernels();
+  // OpenCL binaries are not executable until built. Some XRT stacks accept a
+  // kernel request without this call, while conforming ICDs return
+  // CL_INVALID_PROGRAM_EXECUTABLE; building here makes the deployed xclbin path
+  // portable and surfaces the device's build log on an ABI/device mismatch.
+  err = clBuildProgram(prog_, 1, &dev_, nullptr, nullptr, nullptr);
+  if (err != CL_SUCCESS) {
+    char log[8192] = {0};
+    clGetProgramBuildInfo(prog_, dev_, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+    fprintf(stderr, "[hpocl] xclbin build failed (%d):\n%s\n", err, log);
+    release_program();
+    return false;
+  }
+  if (acquire_kernels()) return true;
+  release_program();
+  return false;
 }
 
 bool Runtime::load_program(const std::vector<std::string>& files,
@@ -400,12 +522,16 @@ void Runtime::threshold_cf(const double* lam, int C, int K, int d, int M,
     }
     return;
   }
-  // fp32-capable-only devices (Apple Metal GPU, area-constrained PL builds)
-  // take the single-precision datapath; host interface stays double.
+  // The element width is the BUILD's, not the device's: `real` in
+  // kernels/threshold_cf.cl is float unless the program was built with
+  // -DHPOCL_FP64, and a wrapper that guessed from CL_DEVICE_DOUBLE_FP_CONFIG would
+  // hand an fp32 kernel double buffers -- measured on an NVIDIA L4 (fp64-capable)
+  // with the PL configuration forced: every tau came back 0.0 while the int flags
+  // still looked sane, so the bench passed. The host interface stays double.
   std::vector<float> lamf, cff, tauf;
   const void* src = (const void*)lam;
   size_t es = sizeof(double);
-  if (!dev_fp64_) {
+  if (!prog_fp64_) {
     lamf.assign(lam, lam + (size_t)C * K * d);
     cff.resize(C); tauf.resize(C);
     src = lamf.data(); es = sizeof(float);
@@ -425,7 +551,7 @@ void Runtime::threshold_cf(const double* lam, int C, int K, int d, int M,
   clSetKernelArg(k_cf, 8, sizeof(cl_mem), &b3);
   size_t g[1] = {(size_t)C};
   ndrange(k_cf, 1, g, nullptr);
-  if (dev_fp64_) {
+  if (prog_fp64_) {           // ... and the readback matches the write width
     rdbuf(b1, tau_cf_dB, sizeof(double) * C);
     rdbuf(b2, tau_dB, sizeof(double) * C);
   } else {
@@ -444,13 +570,27 @@ void Runtime::threshold_cf(const double* lam, int C, int K, int d, int M,
 namespace {
 using dcmp = std::complex<double>;
 
-// kernels/decomp.cl sizes every __private array by MAXM/MAXD and rejects
-// out-of-contract dimensions by returning, which leaves the output buffers at
-// the zeros they were created with. Refuse on the host instead, the way
-// power_iter already does for PMAX. tools/check_registry.py cross-checks these
-// three pairs against the #defines in the kernel sources, so they cannot drift.
-constexpr int kDecompMaxM = 16;   // == MAXM in kernels/decomp.cl
-constexpr int kDecompMaxD = 8;    // == MAXD in kernels/decomp.cl
+// kernels/decomp.cl sizes every __private array by a PER-KERNEL ceiling and
+// rejects out-of-contract dimensions by returning, which leaves the output
+// buffers at the zeros they were created with. Refuse on the host instead, the
+// way power_iter already does for PMAX, so the PS can never hand back a number
+// the fabric could not have produced. tools/check_capacity.py cross-checks all
+// three pairs against the #defines in the kernel source, so they cannot drift.
+//
+// jacobi_svd gets the large pair because the BD front end feeds it the
+// interference stack: null_basis factorises A [(K-1)*Nr x NRF] = 28 x 32 at
+// K=8, Nr=4, NRF=32 and analog_precoder factorises H_u [Nr x Nt] = 4 x 16
+// (ref/frontend.cpp). gmd/ucd/cbd only ever see rows = nul = NRF-(K-1)*Nr = 4
+// and d <= 8 streams, and a static __private array is allocated at its ceiling
+// for every work-item whether or not the launch uses it -- so sharing one large
+// pair would cost gmd_k 12.5x, ucd_k 21.7x and cbd_k 14.4x in private footprint
+// for nothing (the arithmetic is in the decomp.cl header comment).
+constexpr int kJacobiMaxM = 32;   // == DECOMP_MAXM in kernels/decomp.cl
+constexpr int kJacobiMaxD = 40;   // == DECOMP_MAXD in kernels/decomp.cl
+constexpr int kGmdMaxM    = 16;   // == GMD_MAXM    (gmd_k and ucd_k)
+constexpr int kGmdMaxD    = 8;    // == GMD_MAXD
+constexpr int kCbdMaxM    = 16;   // == CBD_MAXM    (cbd_k urows and vrows)
+constexpr int kCbdMaxD    = 8;    // == CBD_MAXD
 
 // A refused or failed launch must not leave the caller's buffer holding its
 // previous contents: NaN for floats, -1 for counts (active_count is >= 1 by
@@ -468,12 +608,17 @@ void nan_fill(int* p, size_t n) {
   if (!p) return;
   for (size_t i = 0; i < n; ++i) p[i] = -1;
 }
-bool dims_ok(const char* who, int rows, int d) {
-  if (rows >= 1 && rows <= kDecompMaxM && d >= 1 && d <= kDecompMaxD) return true;
+// maxm/maxd are passed in rather than read from a global because each decomp
+// kernel has its own ceiling; `macro` names it in the message so the fix is
+// unambiguous (the kernel #define and this mirror move together, and
+// tools/check_capacity.py fails the build if they do not).
+bool dims_ok(const char* who, int rows, int d, int maxm, int maxd,
+             const char* macro) {
+  if (rows >= 1 && rows <= maxm && d >= 1 && d <= maxd) return true;
   fprintf(stderr, "[hpocl] %s: rows=%d d=%d outside the kernel's capacity "
-          "(MAXM=%d MAXD=%d in kernels/decomp.cl) -- raise them there and in "
-          "kDecompMaxM/kDecompMaxD, outputs NaN-filled\n", who, rows, d,
-          kDecompMaxM, kDecompMaxD);
+          "(%s: MAXM=%d MAXD=%d in kernels/decomp.cl) -- raise them there and "
+          "in the matching k*Max* mirror, outputs NaN-filled\n", who, rows, d,
+          macro, maxm, maxd);
   return false;
 }
 std::vector<float> pack2(const dcmp* v, size_t n) {
@@ -500,7 +645,7 @@ void Runtime::jacobi_svd(const dcmp* A, int C, int m, int d, int sweeps,
                          dcmp* U, double* S, dcmp* V) {
   cl_kernel k = kernel("jacobi_svd");
   if (!k) return no_kernel("jacobi_svd");
-  if (!dims_ok("jacobi_svd", m, d)) {
+  if (!dims_ok("jacobi_svd", m, d, kJacobiMaxM, kJacobiMaxD, "DECOMP_MAXM/DECOMP_MAXD")) {
     nan_fill(U, (size_t)C * m * d); nan_fill(S, (size_t)C * d);
     nan_fill(V, (size_t)C * d * d);
     return;
@@ -539,7 +684,7 @@ void Runtime::gmd_op(const dcmp* P0, const double* sigma, int C, int rows,
                      int d, dcmp* R, dcmp* P) {
   cl_kernel k = kernel("gmd_k");
   if (!k) return no_kernel("gmd_k");
-  if (!dims_ok("gmd_op", rows, d)) {
+  if (!dims_ok("gmd_op", rows, d, kGmdMaxM, kGmdMaxD, "GMD_MAXM/GMD_MAXD")) {
     nan_fill(R, (size_t)C * d * d); nan_fill(P, (size_t)C * rows * d);
     return;
   }
@@ -575,7 +720,7 @@ void Runtime::ucd_op(const dcmp* Veff, const double* sigma, int C, int rows,
                      double* rho_eq, dcmp* upper, double* pl) {
   cl_kernel k = kernel("ucd_k");
   if (!k) return no_kernel("ucd_k");
-  if (!dims_ok("ucd_op", rows, d)) {
+  if (!dims_ok("ucd_op", rows, d, kGmdMaxM, kGmdMaxD, "GMD_MAXM/GMD_MAXD")) {
     nan_fill(Vd, (size_t)C * rows * d); nan_fill(rho_eq, C);
     nan_fill(upper, (size_t)C * d * d); nan_fill(pl, (size_t)C * d);
     return;
@@ -625,9 +770,10 @@ void Runtime::cbd_op(const dcmp* U, const dcmp* V, const double* sigma, int C,
                      int* active_count) {
   cl_kernel k = kernel("cbd_k");
   if (!k) return no_kernel("cbd_k");
-  // cbd_k bounds its private q/p arrays by MAXM and A/B by MAXD, so urows and
-  // vrows are both checked against MAXM.
-  if (!dims_ok("cbd_op", urows, d) || !dims_ok("cbd_op", vrows, d)) {
+  // cbd_k bounds its private q/p arrays by CBD_MAXM and A/B by CBD_MAXD, so
+  // urows and vrows are both checked against CBD_MAXM.
+  if (!dims_ok("cbd_op", urows, d, kCbdMaxM, kCbdMaxD, "CBD_MAXM/CBD_MAXD") ||
+      !dims_ok("cbd_op", vrows, d, kCbdMaxM, kCbdMaxD, "CBD_MAXM/CBD_MAXD")) {
     nan_fill(Q, (size_t)C * urows * d); nan_fill(R, (size_t)C * d * d);
     nan_fill(P, (size_t)C * vrows * d); nan_fill(active_count, C);
     return;
@@ -703,6 +849,68 @@ bool dp_dims_ok(const char* who, int m, int nsymtot) {
   }
   return true;
 }
+
+// `grp` is bits per demod work-item: the launch is gid(1) = ceil(m/grp) and group
+// g owns bits [g*grp, min(g*grp+grp, m)). grp < 1 makes EVERY group's range empty
+// and grp > m leaves the bits above the first group unwritten, so both would hand
+// the caller a buffer the kernel never filled. kernels/datapath.cl already refuses
+// them by writing a NaN sentinel; this refuses one level earlier, where the
+// caller's own argument is still visible, and NaN-fills the SAME sentinel, so the
+// observable result is unchanged (thp_precoder does this for K > KMAX). The fill
+// is the point: an early return without it would leave the caller reading whatever
+// its uninitialised buffer held -- a plausible number instead of an error, which
+// is the failure mode dp_dims_ok exists to prevent.
+bool dp_grp_ok(const char* who, int m, int grp, float* llr, int nsymtot) {
+  if (grp >= 1 && grp <= m) return true;
+  fprintf(stderr, "[hpocl] %s: bad grp=%d for m=%d (bits per work-item, must be "
+          "in 1..m); the LLR output is NaN-filled\n", who, grp, m);
+  for (size_t i = 0; i < (size_t)nsymtot * m; ++i) llr[i] = NAN;
+  return false;
+}
+
+// tx_combine_k's work-group shape, chosen from a MEASUREMENT rather than left to
+// the implementation. The kernel shares its digital stage through __local, so the
+// group shape decides how many antennas reuse one bb[r][sym]; and a NULL local
+// size -- what this wrapper used to pass -- lets the implementation pick, which on
+// the Apple M4 GPU means 32x1. Kernel EVENT time at the largest shape in any
+// config pool (Nt=128, NRF=32, T=32, nsym=8192), Apple M4 GPU, medians of 11
+// rounds with the group shapes run in ALTERNATING order inside one process, and
+// the output bit-identical in EVERY configuration (same |x| sample 73.988710,
+// drift 0.0e+00 between rounds):
+//     untiled (-DTXC_LOCAL_MAX=4), any group shape   316-326 us
+//     tiled, NULL local size (the device picks 32x1) 106-111 us
+//     tiled, 8x32 / 16x16 / 32x8 / 128x1              64.7 / 43.2 / 32.6 / 33.2
+//     tiled, 64x4                                     19.6-24.5 us
+// i.e. the tiling is worth 2.9x at the shape a NULL launch gets and 13-16x at the
+// best explicit one, and the group shape alone is worth 4.3-5.7x on top of the
+// tiling. COLD-START CAVEAT, because it produced one wrong conclusion before the
+// alternating measurement: the FIRST configuration run in a fresh process reads
+// ~66.7 us for 64x4 and settles to 19.6-24.5 us after a few rounds of the same
+// kernel, while NULL reads 106-111 us cold or warm. Quote warm medians from an
+// alternating sequence; a single-configuration fresh process understates the win
+// by 2.7x and can make a 4.5x change look like a wash.
+// The rule: the largest power of two <= 64 along the antenna that the kernel's
+// CL_KERNEL_WORK_GROUP_SIZE and the device's CL_DEVICE_MAX_WORK_ITEM_SIZES both
+// accept, times 4 along the symbol, with the grid ROUNDED UP to a multiple of it.
+// Rounding up is safe because tx_combine_k guards a >= Nt and sym >= nsym on every
+// path, including the barrier side of the tiled one, so the extra work-items are
+// inert; it is also the only way to pass an explicit local size at all, since
+// OpenCL 1.2 requires global % local == 0 while Nt/nsym are the caller's.
+// A launch the device still rejects falls back to NULL at the call site, so the
+// worst case is the old behaviour and not a failed operator.
+size_t txc_group(cl_kernel k, cl_device_id dev, int want0, size_t* l1_out) {
+  size_t kg = 0, wis[3] = {0, 0, 0};
+  clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_WORK_GROUP_SIZE, sizeof kg, &kg,
+                           nullptr);
+  clGetDeviceInfo(dev, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof wis, wis, nullptr);
+  size_t l0 = (size_t)want0, l1 = 4;
+  if (wis[1] && l1 > wis[1]) l1 = wis[1];
+  if (wis[0] && l0 > wis[0]) l0 = wis[0];
+  while (l0 > 1 && kg && l0 * l1 > kg) l0 >>= 1;     // shrink the antenna side
+  while (l1 > 1 && kg && l0 * l1 > kg) l1 >>= 1;     // first, then the symbol one
+  *l1_out = l1 ? l1 : 1;
+  return l0 ? l0 : 1;
+}
 }  // namespace
 
 void Runtime::qam_map(const uint8_t* bits, int m, int nsymtot, cplx* s) {
@@ -737,8 +945,19 @@ void Runtime::tx_combine(const cplx* Frf, int Nt, int NRF, const cplx* Fbb,
   clSetKernelArg(k, 5, sizeof(cl_mem), &bS);
   clSetKernelArg(k, 6, sizeof(int), &nsym);
   clSetKernelArg(k, 7, sizeof(cl_mem), &bX);
-  size_t g[2] = {(size_t)Nt, (size_t)nsym};        // (antenna, symbol)
-  ndrange(k, 2, g, nullptr);
+  // (antenna, symbol) grid, ROUNDED UP to a multiple of the measured-best group
+  // shape; see txc_group() for the numbers and for why the padding is inert.
+  size_t l1 = 4;
+  const size_t l0 = txc_group(k, dev_, 64, &l1);
+  size_t g[2] = {((size_t)Nt + l0 - 1) / l0 * l0,
+                 ((size_t)nsym + l1 - 1) / l1 * l1};
+  size_t loc[2] = {l0, l1};
+  if (!ndrange(k, 2, g, loc)) {                    // rejected: the old behaviour
+    size_t gn[2] = {(size_t)Nt, (size_t)nsym};
+    if (!ndrange(k, 2, gn, nullptr))
+      fprintf(stderr, "[hpocl] tx_combine: launch failed with AND without an "
+              "explicit local size (%zux%zu) -- x NOT written\n", l0, l1);
+  }
   rdbuf(bX, x, sizeof(cplx) * (size_t)Nt * nsym);
   clReleaseMemObject(bRf); clReleaseMemObject(bBb);
   clReleaseMemObject(bS);  clReleaseMemObject(bX);
@@ -808,9 +1027,13 @@ void Runtime::modulo_fold(const cplx* in, int nsymtot, float period, cplx* out) 
 }
 
 // one launch covers (symbol, bit-group); the group owns bits
-// [g*grp, min(g*grp+grp, m)), so gid(1) = ceil(m/grp)
+// [g*grp, min(g*grp+grp, m)), so gid(1) = ceil(m/grp). grp >= 1 is guaranteed by
+// dp_grp_ok, which both callers run first -- the `grp > 0 ? grp : m` fallback this
+// used to carry was a second, silent definition of the same guard, and it made
+// grp = 0 mean "one group of m bits" on the host while the kernel read it as an
+// empty range and NaN-filled the row.
 static size_t dp_bit_groups(int m, int grp) {
-  return (size_t)((m + (grp > 0 ? grp : m) - 1) / (grp > 0 ? grp : m));
+  return (size_t)((m + grp - 1) / grp);
 }
 
 void Runtime::softdemod_llr(const cplx* z, int nsymtot, int m, int grp,
@@ -818,6 +1041,7 @@ void Runtime::softdemod_llr(const cplx* z, int nsymtot, int m, int grp,
   cl_kernel k = kernel("softdemod_llr_k");
   if (!k) return no_kernel("softdemod_llr_k");
   if (!dp_dims_ok("softdemod_llr", m, nsymtot)) return;
+  if (!dp_grp_ok("softdemod_llr", m, grp, llr, nsymtot)) return;
   cl_mem bZ = mkbuf(z, sizeof(cplx) * nsymtot, CL_MEM_READ_ONLY);
   cl_mem bL = mkbuf(nullptr, sizeof(float) * (size_t)nsymtot * m, CL_MEM_WRITE_ONLY);
   clSetKernelArg(k, 0, sizeof(cl_mem), &bZ);
@@ -837,6 +1061,7 @@ void Runtime::softdemod_folded(const cplx* z, int nsymtot, int m, int grp,
   cl_kernel k = kernel("softdemod_folded_k");
   if (!k) return no_kernel("softdemod_folded_k");
   if (!dp_dims_ok("softdemod_folded", m, nsymtot)) return;
+  if (!dp_grp_ok("softdemod_folded", m, grp, llr, nsymtot)) return;
   cl_mem bZ = mkbuf(z, sizeof(cplx) * nsymtot, CL_MEM_READ_ONLY);
   cl_mem bL = mkbuf(nullptr, sizeof(float) * (size_t)nsymtot * m, CL_MEM_WRITE_ONLY);
   clSetKernelArg(k, 0, sizeof(cl_mem), &bZ);

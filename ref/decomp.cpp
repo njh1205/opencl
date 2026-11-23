@@ -13,8 +13,15 @@
 //-----------------------------------------------------------------------------
 namespace hpocl {
 
-// private-array bounds of the fp32 mirror, identical to kernels/decomp.cl
-enum { MAXD_ = 8, MAXM_ = 16 };
+// NOTE: this file deliberately carries NO mirror of the fp32 kernels' private
+// array bounds. It used to declare `enum { MAXD_ = 8, MAXM_ = 16 }` "identical
+// to kernels/decomp.cl", which nothing in the file ever read -- and which went
+// stale the moment decomp.cl moved to per-kernel ceilings (DECOMP_ 32x40 for
+// jacobi_svd, GMD_ 16x8, CBD_ 16x8). The fp64 reference is unbounded (std::vector)
+// and the capacity contract is enforced in exactly two places that
+// tools/check_capacity.py keeps in step: the #defines in kernels/decomp.cl and
+// the k*Max* mirrors in runtime/hpocl_runtime.cpp, which refuse the launch and
+// NaN-fill before the kernel can silently return untouched buffers.
 
 //---------------------------------------------------------------------------
 // One-sided Jacobi SVD. Each sweep orthogonalises every column pair (p, q)
@@ -122,6 +129,63 @@ void svd_cplx(const dcplx* A, int m, int n, dcplx* U, double* S, dcplx* V,
                                           : dcplx(0, 0);
     if (V)
       for (int r = 0; r < n; ++r) V[(size_t)r * n + j] = Vv[(size_t)r * n + ord[j]];
+  }
+}
+
+//---------------------------------------------------------------------------
+// Wide economy SVD via the small Gram matrix. See decomp.h for the measurement
+// that justifies it and for the accuracy domain (LEADING triplets only -- this
+// is why null_basis, which needs the trailing ones, stays on svd_cplx).
+//---------------------------------------------------------------------------
+void svd_wide(const dcplx* A, int m, int n, int take, dcplx* U, double* S,
+              dcplx* V, int sweeps) {
+  if (m < 1 || n < 1) return;
+  if (take > m) take = m;                 // rank(A) <= min(m, n)
+  if (take < 0) take = 0;
+  // G = A A^H, accumulated in the same row-major order the caller's A is stored
+  std::vector<dcplx> G((size_t)m * m);
+  for (int i = 0; i < m; ++i)
+    for (int j = 0; j < m; ++j) {
+      dcplx acc(0, 0);
+      for (int k = 0; k < n; ++k)
+        acc += A[(size_t)i * n + k] * std::conj(A[(size_t)j * n + k]);
+      G[(size_t)i * m + j] = acc;
+    }
+  // Symmetrise: G is Hermitian in exact arithmetic but not in fp, and the Jacobi
+  // sweep below assumes it (a non-Hermitian input converges to something else).
+  for (int i = 0; i < m; ++i)
+    for (int j = 0; j < i; ++j) {
+      dcplx mid = 0.5 * (G[(size_t)i * m + j] + std::conj(G[(size_t)j * m + i]));
+      G[(size_t)i * m + j] = mid;
+      G[(size_t)j * m + i] = std::conj(mid);
+    }
+  // G is PSD, so its SVD IS its eigendecomposition: singular values = eigenvalues
+  // (descending, as svd_cplx emits) and the left basis = the eigenvectors.
+  std::vector<dcplx> Eu((size_t)m * m);
+  std::vector<double> lam(m);
+  svd_cplx(G.data(), m, m, Eu.data(), lam.data(), nullptr, sweeps);
+  for (int i = 0; i < m; ++i) S[i] = std::sqrt(std::max(lam[i], 0.0));
+  for (int i = m; i < n; ++i) S[i] = 0.0;   // rank(A) <= m: exact, not truncation
+  if (U)
+    for (size_t i = 0; i < (size_t)m * m; ++i) U[i] = Eu[i];
+  // V[:,j] = A^H u_j / sigma_j. Zero-column cut: RELATIVE (1e-12 * S[0]) rather
+  // than svd_cplx's absolute 1e-12, because here the column being normalised is
+  // a Gram eigenvector whose norm is sigma_j^2, so an absolute cut would depend
+  // on the channel gain. A rank-deficient direction gets a zero column; the
+  // constant-modulus projection downstream then maps arg(0) = 0 to a real
+  // column, which is deterministic where LAPACK's arbitrary unit-norm null
+  // vector is not. No vector in frontend_bench/pipeline_bench is rank-deficient,
+  // and both gates pass unchanged (see the README validation row).
+  const double cut = 1e-12 * (S[0] > 0 ? S[0] : 1.0);
+  for (int j = 0; j < take; ++j) {
+    const double sj = S[j];
+    for (int r = 0; r < n; ++r) {
+      if (sj <= cut) { V[(size_t)r * take + j] = dcplx(0, 0); continue; }
+      dcplx acc(0, 0);
+      for (int i = 0; i < m; ++i)
+        acc += std::conj(A[(size_t)i * n + r]) * Eu[(size_t)i * m + j];
+      V[(size_t)r * take + j] = acc / sj;
+    }
   }
 }
 

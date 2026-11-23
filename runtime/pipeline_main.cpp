@@ -12,7 +12,7 @@
 #include <fstream>
 #include "hpocl_vecio.h"
 #include <cstring>
-#include "pipeline.h"
+#include "hpocl_schedule.h"
 
 using namespace hpocl;
 
@@ -44,25 +44,58 @@ void align_phase(std::vector<dcplx>& mine, const std::vector<dcplx>& ref,
 int main(int argc, char** argv) {
   hpocl::VecReader b(argc > 1 ? argv[1] : "build/pipeline_vectors.bin");
   if (!b.ok()) { fprintf(stderr, "[pipeline_bench] %s\n", b.error().c_str()); return 2; }
+
+  struct CaseData {
+    PipeCfg c{};
+    int nul = 0, mode = 0;
+    double tau = 0;
+    std::vector<dcplx> H, P, B;
+    std::vector<double> sig, rr, rt;
+  };
+
   int ncase = b.i(), fails = 0;
+  std::vector<CaseData> cases(ncase);
+  std::vector<HostScheduleJob> jobs;
+  jobs.reserve(ncase);
   for (int ci = 0; ci < ncase; ++ci) {
-    PipeCfg c;
+    CaseData& x = cases[ci];
+    PipeCfg& c = x.c;
     c.K = b.i(); c.Nt = b.i(); c.Nr = b.i(); c.NRF = b.i(); c.d = b.i();
-    c.M = b.i(); c.variant = b.i(); int nul = b.i();
-    c.gamma_tot_dB = b.f(); double e_tau = b.f();
+    c.M = b.i(); c.variant = b.i(); x.nul = b.i();
+    c.gamma_tot_dB = b.f(); x.tau = b.f();
+    const int T = c.K * c.d;
+    x.H.resize((size_t)c.K * c.Nr * c.Nt);
+    x.P.resize((size_t)c.K * c.Nt * c.d);
+    x.B.resize((size_t)c.K * c.d * c.d);
+    x.sig.resize(T); x.rr.resize(T); x.rt.resize(T);
+    b.cx(x.H); b.cx(x.P); b.re(x.sig); b.cx(x.B); b.re(x.rr); b.re(x.rt);
+    x.mode = b.i();
+    jobs.push_back({x.H.data(), c});
+  }
+  if (!b.expect_done("pipeline_bench")) ++fails;
+
+  // Each case owns its input and PipeOut, so the PS control plane can use the
+  // A53 worker pool without sharing a Runtime or any OpenCL kernel state.
+  CpuExecutor executor;
+  std::vector<PipeOut> outputs(ncase);
+  schedule_host_batch(executor, jobs.data(), jobs.size(), outputs.data());
+  printf("[pipeline_bench] host batch: %d cases, %zu workers", ncase,
+         executor.worker_count());
+  if (executor.affinity_enabled()) {
+    printf(", CPUs");
+    for (size_t i = 0; i < executor.worker_count(); ++i)
+      printf("%s%d", i ? "," : " ", executor.worker_cpu(i));
+  }
+  printf("\n");
+
+  for (int ci = 0; ci < ncase; ++ci) {
+    const CaseData& x = cases[ci];
+    const PipeCfg& c = x.c;
+    const PipeOut& o = outputs[ci];
     const int K = c.K, Nt = c.Nt, d = c.d, T = K * d;
-    std::vector<dcplx> H((size_t)K * c.Nr * Nt), eP((size_t)K * Nt * d),
-        eB((size_t)K * d * d);
-    std::vector<double> eSig(T), eRr(T), eRt(T);
-    b.cx(H); b.cx(eP); b.re(eSig); b.cx(eB); b.re(eRr); b.re(eRt);
-    int eMode = b.i();
-
-    PipeOut o;
-    schedule(H.data(), c, o);
-
-    e_tau = err_tau(o.tau_dB, e_tau);
-    bool mode_ok = o.mode == eMode && o.nul == nul;
-    double e_sig = err_r(o.sigma.data(), eSig.data(), T);
+    const double e_tau = err_tau(o.tau_dB, x.tau);
+    const bool mode_ok = o.mode == x.mode && o.nul == x.nul;
+    const double e_sig = err_r(o.sigma.data(), x.sig.data(), T);
     double e_P = 0, e_B = 0;
     for (int k = 0; k < K; ++k) {
       std::vector<dcplx> P((size_t)Nt * d, dcplx(0, 0));
@@ -71,32 +104,31 @@ int main(int argc, char** argv) {
           dcplx a(0, 0);
           for (int t = 0; t < c.NRF; ++t) {
             dcplx nv(0, 0);                       // F_BB column = N_k V_D,k
-            for (int q = 0; q < nul; ++q)
-              nv += o.Nk[((size_t)k * c.NRF + t) * nul + q] *
-                    o.Vd[((size_t)k * nul + q) * d + j];
+            for (int q = 0; q < x.nul; ++q)
+              nv += o.Nk[((size_t)k * c.NRF + t) * x.nul + q] *
+                    o.Vd[((size_t)k * x.nul + q) * d + j];
             a += o.Frf[(size_t)i * c.NRF + t] * nv;
           }
           P[(size_t)i * d + j] = a;
         }
-      std::vector<dcplx> Pr(eP.begin() + (size_t)k * Nt * d,
-                            eP.begin() + (size_t)(k + 1) * Nt * d);
+      std::vector<dcplx> Pr(x.P.begin() + (size_t)k * Nt * d,
+                            x.P.begin() + (size_t)(k + 1) * Nt * d);
       align_phase(P, Pr, Nt, d);
       e_P = fmax(e_P, err_c(P.data(), Pr.data(), (size_t)Nt * d));
       e_B = fmax(e_B, err_c(o.B.data() + (size_t)k * d * d,
-                            eB.data() + (size_t)k * d * d, (size_t)d * d));
+                            x.B.data() + (size_t)k * d * d, (size_t)d * d));
     }
-    double e_rr = err_r(o.rho_real.data(), eRr.data(), T);
-    double e_rt = err_r(o.rho_tgt.data(), eRt.data(), T);
+    const double e_rr = err_r(o.rho_real.data(), x.rr.data(), T);
+    const double e_rt = err_r(o.rho_tgt.data(), x.rt.data(), T);
 
-    bool ok = e_tau < 1e-5 && mode_ok && e_sig < 1e-9 && e_P < 1e-9 &&
-              e_B < 1e-9 && e_rr < 1e-8 && e_rt < 1e-8;
+    const bool ok = e_tau < 1e-5 && mode_ok && e_sig < 1e-9 && e_P < 1e-9 &&
+                    e_B < 1e-9 && e_rr < 1e-8 && e_rt < 1e-8;
     fails += !ok;
     printf("case%d K=%d NRF=%d d=%d M=%3d var=%d s=%.1fdB mode=%d: tau=%.1e sig=%.1e "
            "P=%.1e B=%.1e rr=%.1e rt=%.1e %s\n",
            ci, K, c.NRF, d, c.M, c.variant, c.gamma_tot_dB, o.mode,
            e_tau, e_sig, e_P, e_B, e_rr, e_rt, ok ? "PASS" : "FAIL");
   }
-  if (!b.expect_done("pipeline_bench")) ++fails;   // drift vs tools/pipeline_ref.py
   printf(fails ? "[pipeline_bench] FAIL\n" : "[pipeline_bench] ALL PASS\n");
   return fails ? 1 : 0;
 }

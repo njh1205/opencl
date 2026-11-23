@@ -1,0 +1,177 @@
+# hpocl numerics gates.
+#
+# Three facts about this repo decide the shape of this file:
+#
+#   1. The gates are the product. 156 fp32 gate lines + 41 FEC gates + four
+#      static gates are what make "the same .cl source runs on four backends"
+#      a claim rather than a hope, so they run on every push.
+#   2. `hpocl` is not self-contained. 17 files under tools/ import the sibling
+#      production repo (../mix_precode, github.com/ningjihang/6g_software_platform),
+#      including two of the static gates, which read the REAL config envelope
+#      from ../mix_precode/*/config_pools/*.json (9 pools, 21 distinct configs).
+#      Both fail loudly when the pools are absent -- they never pass vacuously --
+#      so the sibling checkout is a hard requirement, not a convenience.
+#   3. No board and no Vitis in CI. `make check` runs against a PoCL CPU device
+#      (the Makefile already defaults to DEV ?= cpu). The PL is compile-only
+#      off-board and the A53 is a cycle-model projection; neither is gated here,
+#      and no number produced by this workflow may be quoted as PL performance.
+#
+# Job 1 is deliberately dependency-free (no device, no sibling repo) so that a
+# red there is always a real red rather than an environment failure.
+
+name: gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the oracle path deterministic: no BLAS threading, no denormal flushing.
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  PYTHONHASHSEED: "0"
+
+jobs:
+  # ---------------------------------------------------------------- job 1
+  static-self-contained:
+    name: static gates (no device, no sibling repo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip numpy
+      - name: gh_check + registry_check + deficit_check
+        run: make gh_check registry_check deficit_check
+      - name: record what was gated
+        run: |
+          echo "kernels declared in kernels/*.cl : $(grep -rho '__kernel void [a-z_0-9]*' kernels | sort -u | wc -l)"
+          echo "sources                            : $(ls kernels/*.cl | wc -l) .cl + $(ls kernels/*.clh | wc -l) .clh"
+          echo "The authoritative kernel-count and __constant-pool gates are registry_check"
+          echo "and allprog_check (job 3), which compute them from the build, not from grep."
+
+  # ---------------------------------------------------------------- job 2
+  static-config-envelope:
+    name: static gates against the real config pools (needs ../mix_precode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hpocl
+      - uses: actions/checkout@v4
+        with:
+          repository: ningjihang/6g_software_platform
+          path: mix_precode
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip numpy
+      - name: sibling layout sanity
+        working-directory: mix_precode
+        run: |
+          ls -d classical >/dev/null || { echo "::error::mix_precode/classical missing"; exit 1; }
+          echo "config pools found: $(ls */config_pools/*.json 2>/dev/null | wc -l)"
+      - name: capacity_check + glue_cost_check
+        working-directory: hpocl
+        run: make capacity_check glue_cost_check
+
+  # ---------------------------------------------------------------- job 3
+  device-fp32-full-check:
+    name: make check on a PoCL CPU device (fp32, the shipped precision)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: [static-self-contained, static-config-envelope]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hpocl
+      - uses: actions/checkout@v4
+        with:
+          repository: ningjihang/6g_software_platform
+          path: mix_precode
+      - name: OpenCL runtime (PoCL CPU device + ICD loader + headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+               pocl-opencl-icd ocl-icd-opencl-dev ocl-icd-libopencl1 opencl-headers clinfo
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip numpy scipy
+      - name: record the backend the gates actually ran on
+        working-directory: hpocl
+        run: |
+          clinfo | egrep -i 'Platform Name|Device Name|Device Type|Double FP Config|Max constant buffer size|Local memory size|Driver Version' || true
+          c++ --version | head -1
+          python3 -c 'import numpy,scipy;print("numpy",numpy.__version__,"scipy",scipy.__version__)'
+      - name: build
+        working-directory: hpocl
+        run: make build DEV=cpu
+      - name: full gate suite
+        working-directory: hpocl
+        run: make check DEV=cpu
+      # HPOCL_CLOPTS is read with getenv() (runtime/allprog_main.cpp:53,
+      # bench_main.cpp:38, cf_main.cpp:94), so it MUST be an environment
+      # variable. `make allprog_check HPOCL_CLOPTS=...` would set a make
+      # variable that is never exported and silently gate the default config.
+      - name: allprog_check again with the deployed PL flag set forced on
+        working-directory: hpocl
+        env:
+          HPOCL_CLOPTS: -DHPOCL_FP32
+        run: make allprog_check DEV=cpu
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gate-logs
+          path: |
+            hpocl/build/*.log
+            hpocl/build/*.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- job 4
+  # Exploratory: the fp64 branch is real code (verified on a Tesla P40,
+  # cl = 7.61e-16 dB against a 1e-6 dB gate, 39/40 tau bit-identical to fp32)
+  # but there is no in-tree record of it running on PoCL, and the __constant
+  # pool at fp64 is 128 896 B = 1.97x over the 64 KB spec minimum, which failed
+  # as CL_INVALID_BUFFER_SIZE (-61) on a P40 and as a ptxas error on an L4.
+  # A red here is information, not a regression, hence continue-on-error.
+  device-fp64-exploratory:
+    name: fp64 kernel path on PoCL (exploratory, non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    needs: [static-self-contained]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hpocl
+      - uses: actions/checkout@v4
+        with:
+          repository: ningjihang/6g_software_platform
+          path: mix_precode
+      - name: OpenCL runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+               pocl-opencl-icd ocl-icd-opencl-dev ocl-icd-libopencl1 opencl-headers clinfo
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip numpy scipy
+      - name: does this device advertise fp64 at all
+        working-directory: hpocl
+        run: clinfo | egrep -i 'Device Name|Double FP Config|Max constant buffer size' || true
+      - name: cf_bench with -DHPOCL_FP64
+        working-directory: hpocl
+        env:
+          HPOCL_CLOPTS: -DHPOCL_FP64
+        run: make cf_bench DEV=cpu

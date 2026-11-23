@@ -63,8 +63,32 @@ def bit_cols(idx, nb):
 
 
 def modulo_period(m):
-    """THP receive-modulo period L*spacing (qam_axis_order_and_spacing)."""
-    return (1 << (m // 2)) * pam_delta(m)
+    """THP receive-modulo period L*spacing, spelled the way production's RECEIVE
+    fold spells it.
+
+    Production has two algebraically equal spellings that are 1 ulp apart at
+    m in {2, 8} (identical at m = 4, 6):
+
+      thp_precoding.qam_axis_order_and_spacing  ->  L * (2/sqrt(2(L^2-1)/3))
+          used by thp_receive_equalized, i.e. by the receive fold, and by
+          ref/modem.cpp and tools/modem_ref.py
+      multiuser_simulation_environment.qam_modulo_period  ->  L * sqrt(6/(M-1))
+          which is what pam_delta() computes, and what this file used to use
+
+    The receive fold is the authority for this chain, so this now matches it
+    bit-for-bit and check_production's period assert can be an exact equality
+    instead of a 1e-12 tolerance papering over the two. chain_bench is the one
+    gate that computes the period independently on both sides (C++ = thp
+    spelling, oracle = this file), so the 1 ulp was live exposure there the
+    moment a case used m = 2 or 8 -- today chain_ref.CASES are M = 16 and 64,
+    where the two spellings agree exactly, which is why nothing had caught it.
+    Measured effect of the change: datapath_vectors.bin's period shifts 1 ulp at
+    m = 2/8, moving zf/llr_fold by <= 9.9e-16 (the fold is continuous in period
+    unless floor() flips, and the closest any probe gets to +-period/2 is 1e-5,
+    about 2.2e10 ulps), against gates of 1e-4 / 3e-3.
+    """
+    L = 1 << (m // 2)
+    return L * (2.0 / np.sqrt(2.0 * (L * L - 1) / 3.0))
 
 
 def qam_map(bits, m):
@@ -145,6 +169,24 @@ def gmi(llr, bits, m):
     return m - sp.sum(-1).mean(-1) / np.log(2.0)
 
 
+def labeled_points(cand, clab):
+    """label tuple -> sorted list of the points carrying it: an order-free view.
+
+    Needed because production lists its QPSK table in Gray-LABEL order
+    (-1-1j, -1+1j, +1+1j, +1-1j) while constellation() lists every order in
+    level-index order (I axis outer, amplitude ascending) -- the two agree for
+    16/64/256-QAM, whose production branches are `for real in pam_gray: for imag
+    in pam_gray`, and are a permutation of one another at m = 2. A logsumexp
+    consumes the label -> point PAIRING and nothing else, so comparing pairings
+    is the order-free (and for QPSK the only possible) element-wise check.
+    """
+    out = {}
+    for c, l in zip(cand, clab):
+        out.setdefault(tuple(int(v) for v in l), []).append((float(c.real),
+                                                             float(c.imag)))
+    return {k: sorted(v) for k, v in out.items()}
+
+
 def check_production(extra_replica_cases=()):
     """Pin label -> symbol, the replica lattice and the modulo to production.
 
@@ -175,11 +217,30 @@ def check_production(extra_replica_cases=()):
         assert np.array_equal(gray_decode(np.arange(L) ^ (np.arange(L) >> 1)),
                               np.arange(L)), f"gray decode is not the inverse at m={m}"
 
-    for m, radius in ((4, 2), (6, 2), (8, 1)) + tuple(extra_replica_cases):
+    # (2, 2) first: QPSK at radius 2 is the one order/radius where the replica
+    # lattice overlaps the base one (period 2*delta puts a replica exactly delta
+    # from a base point, so the flipped-bit subset gains a second co-minimal
+    # candidate and the folded LLR shifts by log 2). It was not covered here,
+    # and it cannot be covered by the element-wise form: production's QPSK row
+    # order differs from ours, so the lattice is compared as label -> points.
+    for m, radius in ((2, 2), (4, 2), (6, 2), (8, 1)) + tuple(extra_replica_cases):
         cand, clab = folded_candidates(m, radius)
         pcand, pclab = enumerate_thp_symbol_replicas(m, radius)
-        assert np.abs(cand - pcand).max() < 1e-12 and np.array_equal(clab, pclab), \
-            f"replica lattice differs at m={m} radius={radius}"
+        if m != 2:            # row order matches production for 16/64/256-QAM
+            assert np.abs(cand - pcand).max() < 1e-12 and \
+                np.array_equal(clab, pclab), \
+                f"replica lattice differs at m={m} radius={radius}"
+        mine, prod = labeled_points(cand, clab), labeled_points(pcand, pclab)
+        assert mine.keys() == prod.keys(), \
+            f"replica label set differs at m={m} radius={radius}"
+        worst = 0.0
+        for k, pts in mine.items():
+            ppts = prod[k]
+            assert len(pts) == len(ppts), f"replica multiplicity at m={m} label {k}"
+            worst = max([worst] + [abs(a[0] - b[0]) + abs(a[1] - b[1])
+                                   for a, b in zip(pts, ppts)])
+        assert worst < 1e-12, \
+            f"replica lattice differs at m={m} radius={radius} ({worst:.3e})"
 
     period = modulo_period(6)
     x = np.array([period / 2, -period / 2, period / 2 - 1e-3, -3.1 * period,
@@ -187,5 +248,5 @@ def check_production(extra_replica_cases=()):
     # exact equality: the fold is the same floor expression on both sides
     assert np.abs(mod_fold(x, period) - centered_modulo_complex(x, period)).max() == 0.0
     print("[oracle] production cross-check OK (get_constellation / "
-          "modulate_bits_with_labeling / enumerate_thp_symbol_replicas / "
-          "centered_modulo_complex, M <= 256)")
+          "modulate_bits_with_labeling / enumerate_thp_symbol_replicas "
+          "incl. QPSK order-free / centered_modulo_complex, M <= 256)")

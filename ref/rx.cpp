@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "decomp.h"
+#include "frontend.h"   // gemm_wx: the one GEMM primitive, see frontend.h
 
 namespace hpocl {
 namespace {
@@ -45,17 +47,24 @@ void rx_combiner(const dcplx* U, int Nr, const dcplx* V, int rows,
   // any other strategy: Q/R left untouched (production raises ValueError)
 }
 
-double power_norm_scale(const dcplx* Frf, int Nt, int NRF, const dcplx* Fbb,
-                        int T, double p_constraint) {
+double power_norm_from_product(const dcplx* P, int Nt, int T,
+                               double p_constraint) {
   double power = 0.0;                          // ||Frf Fbb||_F^2
   for (int i = 0; i < Nt; ++i)
-    for (int t = 0; t < T; ++t) {
-      dcplx acc(0.0, 0.0);
-      for (int r = 0; r < NRF; ++r)
-        acc += Frf[(size_t)i * NRF + r] * Fbb[(size_t)r * T + t];
-      power += std::norm(acc);
-    }
+    for (int t = 0; t < T; ++t) power += std::norm(P[(size_t)i * T + t]);
   return power > kPowerFloor ? std::sqrt(p_constraint / power) : 1.0;
+}
+
+double power_norm_scale(const dcplx* Frf, int Nt, int NRF, const dcplx* Fbb,
+                        int T, double p_constraint) {
+  // P[i][t] = sum_r Frf[i][r] Fbb[r][t] is gemm_wx with W = Fbb^T, X = Frf, so
+  // the same call can go to the fabric (1.05 Mflop at Nt=128, 25-31% of the
+  // glue). r ascending either way: same bits.
+  std::vector<dcplx> FbbT((size_t)T * NRF), P((size_t)Nt * T);
+  for (int r = 0; r < NRF; ++r)
+    for (int t = 0; t < T; ++t) FbbT[(size_t)t * NRF + r] = Fbb[(size_t)r * T + t];
+  gemm_wx(FbbT.data(), T, NRF, Frf, Nt, P.data());
+  return power_norm_from_product(P.data(), Nt, T, p_constraint);
 }
 
 void rx_diag(const dcplx* R, int d, dcplx* diag_b) {

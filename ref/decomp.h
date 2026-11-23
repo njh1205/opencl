@@ -15,9 +15,53 @@
 namespace hpocl {
 using dcplx = std::complex<double>;
 
-// A [m x n], m >= n, row-major. U [m x n], S [n] descending, V [n x n].
+// A [m x n], row-major. U [m x n], S [n] descending, V [n x n].
+//
+// CONTRACT: m may be SMALLER than n. This header used to say "m >= n", which is
+// wrong and dangerously so: ref/frontend.cpp::null_basis calls it as
+// svd_cplx(A, rows=(K-1)*Nr, n=NRF) = (28, 32) and analog_precoder called it as
+// (Nr, Nt) = (4, 128), both wide. One-sided Jacobi orthogonalises COLUMNS, so a
+// wide A is the natural case: V comes out [n x n] with n - m trailing columns
+// spanning null(A) at singular value ~0, and U's corresponding columns are
+// zeroed by the 1e-12 cut. Nothing in the algorithm requires m >= n.
+// The cost, though, is quadratic in n -- n(n-1)/2 rotations per sweep and a
+// private V of n^2 -- so for m << n use svd_wide() below instead.
 void svd_cplx(const dcplx* A, int m, int n, dcplx* U, double* S, dcplx* V,
               int sweeps = 16);
+
+// Economy SVD of a WIDE matrix A [m x n] with m << n, via the small Gram matrix:
+//   G = A A^H  (m x m, Hermitian PSD)  ->  eigendecomposition  ->  sigma = sqrt
+//   V[:,j] = A^H u_j / sigma_j         (only the `take` leading columns)
+// U [m x m] (may be null), S [n] DESCENDING with the trailing n-m entries
+// EXACTLY zero (rank(A) <= min(m,n), so those are true zeros, not omissions --
+// which is what lets one provider contract serve both this and svd_cplx), and
+// V [n x take] row-major. take is clamped to m.
+//
+// WHY THIS EXISTS: it is the shape the deployed configurations actually have.
+// Over every config in mix_precode/{classical,ai}/config_pools/*.json the analog
+// precoder factorises H_u [Nr x Nt] with Nr <= 8 and Nt up to 128, and one-sided
+// Jacobi on that costs n(n-1)/2 = 8128 rotations per sweep and an n x n = 128x128
+// private V. Measured on this host at K=8, Nt=128, Nr=4, NRF=32, d=4
+// (paper_sweep.json), for the eight per-user SVDs:
+//   svd_cplx (full 128x128 V)  162.5 ms   -- 87% of the 184 ms front end
+//   svd_wide (Gram, 4x4 eig)     0.031 ms -- 5256x faster
+//   leading-subspace agreement   5.4e-15 (fp64 roundoff)
+// and 28x-5691x across the eight real configs. Production's AnalogPrecoder does
+// the same thing implicitly: `svd(H_u, full_matrices=False)` returns vh as
+// [min(Nr,Nt) x Nt], i.e. an ECONOMY V, and only its first min(NRF,Nr,Nt)
+// columns are used. ref/frontend.cpp computing the full [Nt x Nt] V was the
+// port's own waste, not a modelling difference.
+//
+// ACCURACY DOMAIN, and the reason null_basis must NOT use this: forming G squares
+// the condition number, so a singular value at sigma_min/sigma_max = r becomes an
+// eigenvalue at r^2. The LEADING triplets are what this is for and they are
+// exact to roundoff; the trailing ones lose half the digits. fp64 keeps
+// r >= 1e-8 usable, fp32 only r >= 1e-3. null_basis needs the SMALLEST singular
+// vectors (they are the BD basis), which is the worst case for a Gram method and
+// the best case for one-sided Jacobi -- so null_basis stays on svd_cplx and eats
+// the n^2 private array. This split is by accuracy requirement, not by shape.
+void svd_wide(const dcplx* A, int m, int n, int take, dcplx* U, double* S,
+              dcplx* V, int sweeps = 16);
 
 // GMD of diag(sigma) (Hager/Jiang gmd.m): the right basis P0 [rows x d] is
 // rotated into P and the equal-diagonal upper factor R satisfies

@@ -17,37 +17,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <string>
 #include <vector>
 #include "hpocl_runtime.h"
+#include "hpocl_vecio.h"    // the shared bounds-checked reader for tools/*.bin
 #include "mcs_table.clh"   // host side of cqi_select: the integration check below
 
 using cd = std::complex<double>;        // oracle precision
 using cx = hpocl::cplx;                 // device precision (== cl float2)
 
 namespace {
-struct Reader {                               // little-endian, bounds-checked
-  std::vector<uint8_t> buf; size_t o = 0; bool bad = false;
-  explicit Reader(const char* path) {
-    std::ifstream f(path, std::ios::binary);
-    buf.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  }
-  const uint8_t* take(size_t n) {
-    if (o + n > buf.size()) { bad = true; return buf.data(); }
-    const uint8_t* p = buf.data() + o; o += n; return p;
-  }
-  int i() { int v = 0; memcpy(&v, take(4), 4); return v; }
-  double d() { double v = 0; memcpy(&v, take(8), 8); return v; }
-  void u8(std::vector<uint8_t>& v) { memcpy(v.data(), take(v.size()), v.size()); }
-  void cx_(std::vector<cd>& v) {
-    const uint8_t* p = take(16 * v.size());
-    for (cd& e : v) { double re, im; memcpy(&re, p, 8); memcpy(&im, p + 8, 8); p += 16; e = cd(re, im); }
-  }
-  void re(std::vector<double>& v) { memcpy(v.data(), take(8 * v.size()), 8 * v.size()); }
-};
-
 std::vector<cx> pack(const std::vector<cd>& v) {   // fp64 oracle -> fp32 device
   std::vector<cx> o(v.size());
   for (size_t i = 0; i < v.size(); ++i) o[i] = cx((float)v[i].real(), (float)v[i].imag());
@@ -67,7 +45,13 @@ double err_f(const float* got, const E* exp, size_t n) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  Reader rd(argc > 1 ? argv[1] : "build/datapath_vectors.bin");
+  const char* vec = argc > 1 ? argv[1] : "build/datapath_vectors.bin";
+  hpocl::VecReader rd(vec);
+  if (!rd.ok()) {
+    fprintf(stderr, "[datapath] %s (run: python3 tools/datapath_ref.py)\n",
+            rd.error().c_str());
+    return 2;
+  }
   hpocl::Runtime rt;
   const char* dev = argc > 2 ? argv[2] : "cpu";
   // HPOCL_CLOPTS forwards extra -D macros to the device compiler, so a PL-style
@@ -90,20 +74,53 @@ int main(int argc, char** argv) {
     int Nt = rd.i(), Nr = rd.i(), NRF = rd.i(), U = rd.i(), d = rd.i(),
         nsym = rd.i(), m = rd.i(), radius = rd.i(), has_diag = rd.i(),
         nedge = rd.i();
-    double n0 = rd.d(), period = rd.d();
-    const int T = U * d, ng = (m + grp - 1) / grp;
+    double n0 = rd.f(), period = rd.f();
+    const int T = U * d;
     const size_t nsymtot = (size_t)T * nsym, nllr = nsymtot * m,
                  nf = nsymtot + nedge, nllf = nf * m;
 
+    // Pre-flight, before a single allocation. The header just read sizes every
+    // vector below, and all five vector files are argv[1], so pointing this
+    // bench at the wrong one used to read a garbage dimension and ask for
+    // gigabytes (measured: 18 s of thrashing, then SIGKILL/137 with no message).
+    // VecReader bounds-checks each *read*, which happens too late; take() asks
+    // the bounds question up front and validates without consuming.
+    if (Nt < 1 || Nt > 4096 || Nr < 1 || Nr > 4096 || NRF < 1 || NRF > 4096 ||
+        U < 1 || U > 64 || d < 1 || d > 64 || nsym < 1 || nsym > 65536 ||
+        (m != 2 && m != 4 && m != 6 && m != 8) || radius < 0 || radius > 8 ||
+        (has_diag != 0 && has_diag != 1) || nedge < 0 || nedge > 4096 ||
+        !(n0 > 0.0) || !(period > 0.0)) {
+      fprintf(stderr, "[datapath] case%d: implausible header Nt=%d Nr=%d NRF=%d "
+              "U=%d d=%d nsym=%d m=%d radius=%d diag=%d nedge=%d n0=%g "
+              "period=%g -- wrong vector file? (run: python3 "
+              "tools/datapath_ref.py)\n", ci, Nt, Nr, NRF, U, d, nsym, m,
+              radius, has_diag, nedge, n0, period);
+      return 2;
+    }
+    // Element counts, named once and used for both the byte count and the
+    // allocations: 16 B per complex128, 8 B per float64, 1 B per bit. The total
+    // must equal the case's on-disk size EXACTLY -- expect_done() at the end of
+    // the run independently confirms that (zero trailing bytes), so a miscount
+    // here cannot silently become a miscount there. Field order is
+    // tools/datapath_ref.py::field_list: s and z are nsymtot each, zf_in and zf
+    // are nf each, and n (noise) and y (received) are both Nr*nsym.
+    const size_t n_Frf = (size_t)Nt * NRF, n_Fbb = (size_t)NRF * T,
+                 n_H = (size_t)Nr * Nt,   n_n = (size_t)Nr * nsym,
+                 n_W = (size_t)U * Nr * d, n_x = (size_t)Nt * nsym;
+    const size_t need = nllr
+        + 16 * (n_Frf + n_Fbb + n_H + 2 * n_n + n_W + (size_t)T + 2 * nsymtot
+                + n_x + 2 * nf)
+        + 8 * (nllr + nllf + 2 * (size_t)T);
+    if (!rd.take(need, "datapath case")) return 2;
+
     std::vector<uint8_t> bits(nllr);
-    std::vector<cd> Frf((size_t)Nt * NRF), Fbb((size_t)NRF * T), H((size_t)Nr * Nt),
-        n((size_t)Nr * nsym), W((size_t)U * Nr * d), diag(T), es(nsymtot),
-        ex((size_t)Nt * nsym), ey((size_t)Nr * nsym), ez(nsymtot), ezfin(nf), ezf(nf);
+    std::vector<cd> Frf(n_Frf), Fbb(n_Fbb), H(n_H), n(n_n), W(n_W), diag(T),
+        es(nsymtot), ex(n_x), ey(n_n), ez(nsymtot), ezfin(nf), ezf(nf);
     std::vector<double> ellr(nllr), ellf(nllf), egmi(T), egmf(T);
-    rd.u8(bits); rd.cx_(Frf); rd.cx_(Fbb); rd.cx_(H); rd.cx_(n); rd.cx_(W); rd.cx_(diag);
-    rd.cx_(es); rd.cx_(ex); rd.cx_(ey); rd.cx_(ez); rd.cx_(ezfin); rd.cx_(ezf);
+    rd.by(bits); rd.cx(Frf); rd.cx(Fbb); rd.cx(H); rd.cx(n); rd.cx(W); rd.cx(diag);
+    rd.cx(es); rd.cx(ex); rd.cx(ey); rd.cx(ez); rd.cx(ezfin); rd.cx(ezf);
     rd.re(ellr); rd.re(ellf); rd.re(egmi); rd.re(egmf);
-    if (rd.bad) { fprintf(stderr, "[datapath] truncated vectors file\n"); return 2; }
+    if (rd.bad()) return 2;              // VecReader already printed the offset
 
     std::vector<cx> cFrf = pack(Frf), cFbb = pack(Fbb), cH = pack(H), cn = pack(n),
                     cW = pack(W), cdiag = pack(diag), czfin = pack(ezfin);
@@ -125,7 +142,6 @@ int main(int argc, char** argv) {
                         (float)n0, gll0.data());   // radius 0 == parallel branch
     rt.gmi(gllr.data(), bits.data(), m, nsym, T, ggmi.data());
     rt.gmi(gllf.data(), bits.data(), m, nsym, T, ggmf.data());
-    (void)ng;
 
     // Last hop of the chain: per-stream GMI -> CQI index / code rate. rate_bench
     // already gates mcs_select exhaustively against an independent numpy oracle
@@ -173,7 +189,7 @@ int main(int argc, char** argv) {
            eq, etx, ech, erx, efo, el, elf, e0, eg, egf, mcs_mism, gm / T,
            gmf / T, m, se_par, se_fold, out_par, T, ok ? "PASS" : "FAIL");
   }
-  if (rd.o != rd.buf.size()) { fprintf(stderr, "[datapath] vector file size mismatch\n"); ++fails; }
+  if (!rd.expect_done("datapath_bench")) ++fails;   // contract drift vs the oracle
   printf(fails ? "[datapath_bench] FAIL\n" : "[datapath_bench] ALL PASS\n");
   return fails ? 1 : 0;
 }

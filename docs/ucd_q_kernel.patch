@@ -1,0 +1,68 @@
+# NOT APPLIED -- the user deferred this ("2 先算了"). Kept so the work is not lost.
+#
+# WHAT IT IS: the gmd_dev left-basis (Q0/qrows/Q) half of the receive-combiner
+# offload. With this, gmd_k can emit q_gmd and ucd_k can emit w_ucd, so the
+# receive combiner stops being PS-only. It is the kernel half ONLY: the
+# runtime wrappers (Runtime::gmd_op / ucd_op need U/urows/Q parameters), the
+# decomp_main gates (e_Q is currently compared for strat==3 only, although
+# tools/decomp_ref.py already ships q_gmd and w_ucd for strats 1 and 2) and the
+# registry/xclbin call-site updates are NOT in this diff.
+#
+# SCOPE OF THIS DIFF: the gmd_dev core only (Q0/qrows/Q plumbing: the entry
+# copy, the pivot swap in lockstep with P, and the g2 left-Givens transcribed
+# from ref/decomp.cpp). The gmd_k/ucd_k signature changes that would expose it
+# (U/qrows/Q on gmd_k; U/urows/Q = w_ucd on ucd_k, with left_scale =
+# sqrt(pl)*sg/saug and production's safe_diagonal floor) were written and
+# syntax-checked too but are NOT in this file -- re-derive them from
+# ref/decomp.cpp::gmd_factors and ref/rx.cpp's 'u' branch, which are the
+# authority for the formulas.
+#
+# STATUS: syntax-checked with `clang -x cl -cl-std=CL1.2 -fsyntax-only` and
+# nothing more. The NUMERICS ARE UNVERIFIED -- decomp_bench has never run this
+# code, so do not assume the left-Givens transcription from ref/decomp.cpp's
+# gmd_factors is right until e_Q for strats 1 and 2 is gated against the oracle.
+#
+# WHY IT WAS DEFERRED, with the number that justifies deferring: the combiner is
+# ~us of work against a 1.2 ms null-basis kernel event at the largest pool shape,
+# so offloading it buys nothing today. It becomes worth finishing only if a
+# deployment wants the WHOLE instant on the fabric with no PS round trip.
+#
+# To apply: patch -p1 < docs/ucd_q_kernel.patch   (paths are a/kernels/decomp.cl)
+--- a/kernels/decomp.cl	2026-10-25 23:51:21
++++ b/kernels/decomp.cl	2026-10-25 23:51:22
+@@ -256,8 +256,10 @@
+ // The domains meet only in the mapping loops below; the perm swap keeps the
+ // R column and the P column permutation in lockstep (R col k-1 <-> P col k-1).
+ void gmd_dev(__private const float2* P0, int rows, __private const float* sigma,
+-             int d, __private float2* R, __private float2* P) {
++             int d, __private float2* R, __private float2* P,
++             __private const float2* Q0, int qrows, __private float2* Q) {
+   for (int i = 0; i < rows * d; ++i) P[i] = P0[i];
++  for (int i = 0; i < qrows * d; ++i) Q[i] = Q0[i];
+   for (int i = 0; i < d * d; ++i) R[i] = (float2)(0, 0);
+   __private float df[GMD_MAXD + 1], z[GMD_MAXD];
+   __private int perm[GMD_MAXD + 1], invperm[GMD_MAXD + 1];
+@@ -352,6 +354,10 @@
+       for (int r = 0; r < rows; ++r) {
+         float2 tp = P[r * d + nx - 1]; P[r * d + nx - 1] = P[r * d + pivot - 1];
+         P[r * d + pivot - 1] = tp;
++      }
++      for (int r = 0; r < qrows; ++r) {
++        float2 tq = Q[r * d + nx - 1]; Q[r * d + nx - 1] = Q[r * d + pivot - 1];
++        Q[r * d + pivot - 1] = tq;
+       }
+     }
+     float d1 = df[k], d2 = df[nx], total = d1 + d2, c, s;
+@@ -392,6 +398,12 @@
+       float2 pa = P[r * d + k - 1], pb = P[r * d + nx - 1];
+       P[r * d + k - 1] = c * pa + s * pb;
+       P[r * d + nx - 1] = -s * pa + c * pb;
++    }
++    for (int r = 0; r < qrows; ++r) {
++      float cd1 = c * d1, sd2 = s * d2;
++      float2 qa = Q[r * d + k - 1], qb = Q[r * d + nx - 1];
++      Q[r * d + k - 1] = (float2)(cd1 * qa.x + sd2 * qb.x, cd1 * qa.y + sd2 * qb.y) / sbar;
++      Q[r * d + nx - 1] = (float2)(cd1 * qb.x - sd2 * qa.x, cd1 * qb.y - sd2 * qa.y) / sbar;
+     }
+   }
+   R[(pc - 1) * d + (pc - 1)] = (float2)(sbar, 0);

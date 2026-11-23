@@ -22,6 +22,11 @@ namespace hpocl {
 
 class Runtime {
  public:
+  Runtime() = default;
+  // OpenCL handles have single ownership. Copying a Runtime would duplicate
+  // opaque handles and cause a double release when either copy is destroyed.
+  Runtime(const Runtime&) = delete;
+  Runtime& operator=(const Runtime&) = delete;
   ~Runtime();
   bool init(const char* device_pref);            // "cpu" | "gpu" | "acc"
   bool build(const std::vector<std::string>& cl_files,
@@ -106,7 +111,25 @@ class Runtime {
 
   double last_us() const;                        // profiling of last operator
   void set_verbose(bool v) { verbose_ = v; }
+  // TWO different questions, and conflating them was a real bug (measured on an
+  // NVIDIA L4: `HPOCL_CLOPTS=-DHPOCL_FP32 make check` built the fp32 kernel while
+  // the wrapper still marshalled doubles, because it asked the DEVICE; the kernel
+  // then wrote 4-byte floats into 8-byte slots and every tau came back 0.0, with
+  // flags -- ints, unaffected -- looking plausible, so cf_bench reported ALL PASS):
+  //   device_fp64()  : can this device compile cl_khr_fp64 at all? Callers use it
+  //                    to decide what to ASK for (cf_main/sched_main/allprog_main).
+  //   program_fp64() : what precision was the program ACTUALLY built at? The
+  //                    wrappers use it to size and convert buffers, because that is
+  //                    the only thing the kernel agrees with.
   bool device_fp64() const { return dev_fp64_; }
+  bool program_fp64() const { return prog_fp64_; }
+  // The selected device, for callers that need to ask it things the Runtime does
+  // not model -- allprog_check's board pre-flight (constant-buffer limit vs the
+  // 62.5 KB deficit table, per-kernel CL_KERNEL_PRIVATE_MEM_SIZE) is the reason
+  // this exists. Not a general escape hatch: the wrappers stay the only place
+  // that marshals arguments, so a kernel cannot be launched behind the
+  // capacity guards by going around them.
+  cl_device_id device() const { return dev_; }
   cl_context context() const { return ctx_; }
   cl_command_queue queue() const { return q_; }
   // lookup a kernel object created during build() by name
@@ -119,6 +142,11 @@ class Runtime {
   static const char* const* kernel_names(size_t* count);
 
  private:
+  // build()/load_xclbin() replace the active program. Keep their kernel handles
+  // and the context/queue lifetime explicit so retrying initialization or a
+  // deployment reload cannot leak stale OpenCL objects.
+  void release_program();
+  void reset();
   bool acquire_kernels();   // shared by build() and load_xclbin()
   cl_mem mkbuf(const void* host, size_t bytes, cl_mem_flags extra);
   void rdbuf(cl_mem b, void* host, size_t bytes);
@@ -132,6 +160,10 @@ class Runtime {
   std::string      dev_name_;
   bool             verbose_ = false;
   bool             dev_fp64_ = false;
+  // Precision the loaded program was built at: set by build() from the options it
+  // was given (HPOCL_FP64 present, and no HPOCL_FP32 override) and by
+  // load_xclbin() to false. threshold_cf marshals against THIS, not dev_fp64_.
+  bool             prog_fp64_ = false;
   // One registry, keyed by kernel name: wrappers call kernel("gmd_k") instead
   // of caching handles in members, so adding a kernel means adding one string
   // to kKernelNames[] and one wrapper -- not editing two acquisition tables.

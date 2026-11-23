@@ -1,0 +1,72 @@
+# NOT APPLIED, AND MEASURED-AGAINST -- kept as the evidence, not as pending work.
+#
+# HPOCL_MAX_LOG=1 would replace the exact log-MAP bit metric with production's
+# max-log approximation. It was built and measured, and it is a regression here:
+# it flips the selected MCS at 4 of 16 operating points, including turning a
+# -0.167-bit outage into a scheduled CQI 2, i.e. it schedules a rate the link
+# cannot carry. The exact form costs (2r+1)^2 more distance evaluations only in
+# softdemod_folded_k, which is not the throughput path.
+#
+# Do not apply this. If the fabric ever cannot afford the exact metric, the
+# trade has to be re-measured against mcs_select_k's 1e-5 selection slack, not
+# accepted from this file. See docs/modem_datapath_audit.md.
+--- kernels/datapath.cl	2026-10-25 21:07:46
++++ kernels/datapath.cl	2026-10-25 21:12:03
+@@ -60,6 +60,14 @@
+ // keeps the cached path for every supported constellation, i.e. the default
+ // build is bit-identical to the pre-LLR_CACHE_MAX kernel.
+ #define MMAX 256
++
++// HPOCL_MAX_LOG=1 replaces the exact log-MAP bit metric with production's
++// max_log=True approximation (bicm_metrics.bit_llr_from_distances): the first
++// term of the stabilized form only, so no exp, no log, one sweep instead of two,
++// and no candidate array to cache.
++#ifndef HPOCL_MAX_LOG
++#define HPOCL_MAX_LOG 0
++#endif
+ 
+ #ifndef LLR_CACHE_MAX
+ #define LLR_CACHE_MAX MMAX
+@@ -305,20 +313,28 @@
+           int bit = label_bit(iI, iQ, b, mh);
+           dmin[bit] = fmin(dmin[bit], d2[iI * L + iQ]);
+         }
++#if !HPOCL_MAX_LOG
+       for (int iI = 0; iI < L; ++iI)
+         for (int iQ = 0; iQ < L; ++iQ) {
+           int bit = label_bit(iI, iQ, b, mh);
+           S[bit] += exp((dmin[bit] - d2[iI * L + iQ]) * inv_n0);
+         }
++#endif
+     } else {
+       // recompute: two sweeps over the same M candidates, no private array.
+       // radius 0 and period 0 => replica_sweep degenerates to the base
+       // constellation, i.e. exactly the cached path's candidate set.
+       replica_sweep(r, L, delta, 0, 0.0f, b, mh, 0, inv_n0, dmin, S);
++#if !HPOCL_MAX_LOG
+       replica_sweep(r, L, delta, 0, 0.0f, b, mh, 1, inv_n0, dmin, S);
++#endif
+     }
++#if HPOCL_MAX_LOG
++    llr[(size_t)q * m + b] = (dmin[0] - dmin[1]) * inv_n0;   // production max_log
++#else
+     llr[(size_t)q * m + b] =
+         (dmin[0] - dmin[1]) * inv_n0 + log(S[1]) - log(S[0]);
++#endif
+   }
+ }
+ 
+@@ -356,9 +372,13 @@
+   for (int b = g * grp; b < min(g * grp + grp, m); ++b) {
+     float dmin[2] = {INFINITY, INFINITY}, S[2] = {0.0f, 0.0f};
+     replica_sweep(r, L, delta, radius, period, b, mh, 0, inv_n0, dmin, S);
++#if !HPOCL_MAX_LOG
+     replica_sweep(r, L, delta, radius, period, b, mh, 1, inv_n0, dmin, S);
+     llr[(size_t)q * m + b] =
+         (dmin[0] - dmin[1]) * inv_n0 + log(S[1]) - log(S[0]);
++#else
++    llr[(size_t)q * m + b] = (dmin[0] - dmin[1]) * inv_n0;   // production max_log
++#endif
+   }
+ }
+ 

@@ -16,17 +16,47 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=$ROOT/build/xclbin_$TARGET
 mkdir -p "$OUT"
 
-# fp32 datapath for PL (no fp64 on fabric). NEWTON_ITERS: the *deployed* budget
-# is 20 -- re-measured after kTQ moved 10 -> 5; 8 steps cost 0.087 dB on the
-# cf_bench UCD config (see newton_iters in ref/threshold_cf.h for the sweep).
+# fp32 datapath for PL (no fp64 on fabric). -DHPOCL_FP32 is now REDUNDANT for
+# threshold_cf.cl, which is fp32 BY DEFAULT and takes -DHPOCL_FP64 to opt into
+# double; the flag is kept here because it is explicit, because README.md and
+# docs/QX49DR_SV3_上板依赖清单.md both quote this exact COMMON string, and because
+# dropping it would silently change the build for anyone who re-adds an fp64
+# default later. The inversion is the fix for the footgun this script used to
+# have: the one `v++ -c -t hw` run this repo ever did (docs/vitis_flow_notes.md)
+# did NOT pass -DHPOCL_FP32, so a forgotten flag used to mean "synthesise fp64 on
+# a fabric whose DSP48E2 has no floating point at all". Now a forgotten flag means
+# the deployable datapath. Verified: the new no-flag build is IR-BYTE-IDENTICAL to
+# the old -DHPOCL_FP32 build (clang -emit-llvm, same md5), and the precision block
+# sits ABOVE the two #includes because gh_table.clh and deficit_table.clh select
+# their fp64/fp32 constant block on `#ifndef HPOCL_FP32` -- a fp32 `real` with
+# that macro undefined compiles fine and silently pulls in 125.0 KB of fp64
+# __constant instead of 62.5 KB. threshold_cf.cl now defines it for them.
+# NEWTON_ITERS: the *deployed* budget is 20. Do NOT lower it on the strength of
+# the number this comment used to carry ("8 steps cost 0.087 dB on the cf_bench
+# UCD config"): re-measured over a 390-channel population that deliberately
+# includes the 203 near-flat channels with a finite root (flat_ratio < 0.05) that
+# cf_bench SKIPS, 8 steps cost 7.46e-1 dB worst and 12 steps 5.06e-2 dB, against
+# 1.99e-4 dB at 20. The ladder is not monotone (3 steps happened to land at
+# 1.2e-11 dB, 5 steps at 3.98 dB), so it cannot be extrapolated -- see
+# newton_iters in ref/threshold_cf.h and docs/exp_threshold_policy.md.
 # Keep this in step with ref/threshold_cf.h and kernels/threshold_cf.cl.
-# -I$ROOT/kernels is load-bearing, not cosmetic: threshold_cf.cl #includes
-# gh_table.clh AND deficit_table.clh, the generated ln D grid (10 rows x 1600
-# points, 5 constellations x 2 branches).
+# -I$ROOT/kernels is load-bearing, not cosmetic: threshold_cf.cl #includes THREE
+# headers -- gh_table.clh, deficit_table.clh (the generated ln D grid, 10 rows x
+# 1600 points, 5 constellations x 2 branches) and psi_scan.clh (the near-flat
+# fallback's range, grid size and scan loop, shared verbatim with
+# ref/threshold_cf.cpp and tools/cf_ref.py). psi_scan.clh adds no __constant data:
+# it is two untyped literals, one integer and a macro, so the budget below is
+# unchanged by it.
 # DEPLOYMENT RISK, check it before anything else on the board: the table lands in
-# __constant memory, 62.5 KB of fp32 = 97.7% of the 64 KB OpenCL *spec minimum*
-# for CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE. If XRT reports 64 KB the fp32
-# clBuildProgram fails outright. Mitigations, each one generator invocation plus
+# __constant memory. MEASURED totals (make allprog_check prints this per build):
+#   fp32 (what this script builds)  64 000 + 384 (GH) + 128 (CQI) = 64 512 B
+#                                   = 98.4% of the 64 KB spec minimum, 1 024 B spare
+#   fp64 (-DHPOCL_FP64)            128 000 + 768 + 128 = 128 896 B = 1.97x OVER
+# A real device reporting the spec minimum refuses the fp64 build with
+# CL_INVALID_BUFFER_SIZE (-61) at clCreateKernel -- measured on a Tesla P40
+# (65 536 B), see docs/x86_opencl_notes.md. The fp32 build fits, with 1.6%
+# headroom, so ANY new __constant table needs a budget check first. If XRT
+# reports 64 KB the fp32 build still fits and the fp64 one cannot be linked. Mitigations, each one generator invocation plus
 # `make deficit_check`: `--N 800` (31.25 KB, 8.4e-5 dB interpolation error),
 # `--ms 64,256` (25 KB, other M fall back to GH-48 quadrature), `--ms 64`
 # (12.5 KB). BRAM cost of the shipped grid: 500 Kibit = 14 BRAM36 by capacity,

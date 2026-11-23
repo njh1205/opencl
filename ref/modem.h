@@ -5,8 +5,9 @@
 // mix_precode/classical/{bicm_metrics.py,thp_precoding.py}:
 //   qam_axis_spacing    <- thp_precoding.qam_axis_order_and_spacing
 //   modulo_fold         <- thp_precoding.centered_modulo_complex
-//   qam_table           <- bicm_metrics.get_constellation (16/64/256-QAM:
-//                          per-axis Gray PAM, unit average power)
+//   qam_table           <- bicm_metrics.get_constellation (QPSK/16/64/256-QAM:
+//                          per-axis Gray PAM, unit average power; see the Qam
+//                          comment in modem.cpp for the QPSK row order)
 //   qam_map             <- bicm_metrics.modulate_bits_with_labeling
 //   softdemod_parallel  <- bit metric of estimate_bicm_gmi_parallel_from_received
 //   softdemod_folded    <- bit metric of estimate_bicm_gmi_thp_from_received over
@@ -34,11 +35,14 @@
 namespace hpocl {
 using dcplx = std::complex<double>;
 
-// Modulation order M in {16, 64, 256} -> m in {4, 6, 8}; -1 if unsupported.
+// Modulation order M in {4, 16, 64, 256} -> m in {2, 4, 6, 8}; -1 if
+// unsupported (production's get_constellation raises for the same set).
 int qam_bits_per_symbol(int M);
 // PAM points per axis (L = sqrt(M)), normalized minimum spacing 2/norm with
-// norm = sqrt(2(L^2-1)/3), and the THP modulo period L*spacing.
-// Zero if M is unsupported.
+// norm = sqrt(2(L^2-1)/3), and the THP modulo period L*spacing. Both are
+// thp_precoding.qam_axis_order_and_spacing, whose spacing_map is 2/sqrt(2),
+// 2/sqrt(10), 2/sqrt(42), 2/sqrt(170) for m = 2, 4, 6, 8 -- the same four
+// values this formula produces. Zero if M is unsupported.
 int    qam_axis_order(int M);
 double qam_axis_spacing(int M);
 double qam_modulo_period(int M);

@@ -17,7 +17,16 @@ W_u holds the d columns of the zero-forcing combiner of user u's streams scaled
 so that W^H G = diag(diag_b); dividing by diag_b (thp_receive_equalized) then
 restores unit gain per stream and the soft demodulators can use one scalar noise
 variance n0 = 1/snr_lin (the mean post-equalization variance; a production
-datapath would carry a per-stream vector).
+datapath would carry a per-stream vector -- tools/chain_ref.py's MMSE-UCD case
+does, and runtime/chain_main.cpp launches the demodulator once per stream to
+feed it).
+
+Why one scalar n0 is the right metric scale, and not n0/2 or 2*n0: production
+scores candidates as -|sqrt(snr)*g*(y - c)|^2 (bicm_metrics.estimate_bicm_gmi_*
+_from_received), i.e. it normalises the noise to unit variance by scaling the
+sample. With unit post-equalization gain (g = 1) and snr = 1/n0 that is exactly
+the -|y - c|^2 / n0 these kernels use, so the two conventions agree without a
+factor of two -- E|noise|^2 = n0 per COMPLEX sample, p(y|c) ~ exp(-|y-c|^2/n0).
 
 The field_list() order below is the binary contract with
 runtime/datapath_main.cpp -- keep the two in sync.
@@ -41,6 +50,17 @@ CASES = [          # Nr >= 2T keeps ZF noise sane; diag=None -> NULL diag_b
          diag=(1.3, 0.8)),
     dict(Nt=8,  Nr=6,  NRF=2, U=1, d=2, nsym=16, m=8, snr_db=12.0, radius=1,
          diag=None),
+    # QPSK: Runtime's dp_dims_ok accepts m = 2 and the kernels' MMAX/
+    # LLR_CACHE_MAX bounds are documented against it ("4 is QPSK"), but no case
+    # here used it -- so the smallest constellation was the one shape the device
+    # never ran. m = 2 is also the only order where the THP replica lattice
+    # overlaps the base one: the period is 2*delta and a shift by -2*delta puts a
+    # replica exactly delta from a base point, so the flipped-bit subset has TWO
+    # co-minimal candidates and the folded LLR differs from the parallel one by
+    # exactly log(2) (both branches compute it; check_production pins the
+    # label -> point pairing against production get_constellation at m = 2).
+    dict(Nt=8,  Nr=8,  NRF=4, U=2, d=2, nsym=64, m=2, snr_db=6.0, radius=2,
+         diag=(1.2 + 0.10j, 0.9 - 0.20j, 1.05 + 0.00j, 0.85 + 0.15j)),
 ]
 
 

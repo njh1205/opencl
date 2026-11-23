@@ -132,15 +132,30 @@ def _load_deficit_table():
 DFT = _load_deficit_table() if DEFICIT_TABLE else None
 
 
-def _dft_lookup(row, t):
-    """4-point Lagrange on the uniform ln-t grid. IDENTICAL arithmetic, in the
-    same order, as ref/threshold_cf.cpp dft_lookup() and
-    kernels/threshold_cf.cl dft_lookup(); tools/gen_deficit_table.py
-    interp_ln_deficit() is the reference copy. cf_bench's maxtab column compares
-    this against the C++ and maxcl against the kernel, so a change here is a
-    change in four places."""
+def _dft_lookup(row, t2):
+    """4-point Lagrange on the uniform ln-t grid, keyed on t^2. IDENTICAL
+    arithmetic, in the same order and the same association, as
+    ref/threshold_cf.cpp dft_lookup() and kernels/threshold_cf.cl dft_lookup();
+    tools/gen_deficit_table.py interp_ln_deficit() is the reference copy.
+    cf_bench's maxtab column compares this against the C++ and maxcl against the
+    kernel, so a change here is a change in four places.
+
+    t^2 rather than t because the index is log(t/tlo)/dlnt = 0.5*log(t2/tlo^2)/
+    dlnt, so the deployed path never takes a square root (ref/threshold_cf.cpp
+    k3_of). Reciprocals rather than divisions because the C++ side must not leave
+    a division in its innermost loop and the two have to agree bit for bit.
+
+    x is CLIPPED to [0, n-1], and that clip is load-bearing, not a guard: t2
+    below tlo^2 gives x < 0, i0 clamps to 0 and f = 0, so the weights reduce to
+    (1,0,0,0) and the lookup returns the table's own low-edge entry exactly. That
+    entry is log2(M) to <= 1.6e-6 dB (worst at M = 1024, read off the committed
+    grid), i.e. 3242x smaller than the 5.20e-3 dB tail handover already shipped
+    at DFT_THI -- so below the grid the deployed evaluator is the t -> 0 limit
+    rather than the GH-48 rule, which costs 46 080 multiply-accumulates and
+    ~46 000 exp() to reproduce the same constant to 1e-8 relative. The rule is
+    still what deficit_*_quad() returns and still what the maxq column gates."""
     tab, n = DFT["tab"], DFT["n"]
-    x = np.log(np.asarray(t, dtype=np.float64) / DFT["tlo"]) / DFT["dlnt"]
+    x = 0.5 * np.log(np.asarray(t2, dtype=np.float64) * (1.0 / (DFT["tlo"] * DFT["tlo"]))) * (1.0 / DFT["dlnt"])
     x = np.clip(x, 0.0, n - 1.0)
     i0 = int(np.clip(np.floor(x) - 1, 0, n - 4))
     f = x - i0
@@ -152,7 +167,16 @@ def _dft_lookup(row, t):
     return w0 * y[i0] + w1 * y[i0 + 1] + w2 * y[i0 + 2] + w3 * y[i0 + 3]
 
 
-def _t(g, M): return np.sqrt(6.0 / (M - 1)) * np.sqrt(g / 2)
+def _t2(g, M):
+    """t^2 = delta^2 * gamma / 2 = gamma * 3/(M-1). Verbatim the spelling of
+    ref/threshold_cf.cpp k3_of() and kernels/threshold_cf.cl t2_of(), association
+    included. The old sqrt(6/(M-1))*sqrt(g/2) form differs by ~1 ulp, and a
+    1-ulp branch flip at DFT_THI is 5.2e-3 dB against a 1e-9 nat maxtab gate --
+    which is how the t-based maxtab probe failed once already."""
+    return g * (3.0 / (M - 1))
+
+
+def _t(g, M): return np.sqrt(_t2(g, M))
 def _c(mod, M):
     L = np.sqrt(M); cmod = 4 * np.pi / np.log(2)
     return cmod if mod else cmod * (L - 1) / L
@@ -165,20 +189,25 @@ def _lnQ_asym(t):
     c = 1.0 - 1.0 / t2 + 3.0 / (t2 * t2)
     return l + np.log(c if c > 0.0 else 1.0)
 def _branch(g, M):
-    """(evaluator, table row group, t). 0 = ln-D table, 1 = analytic tail,
+    """(evaluator, table row group, t^2). 0 = ln-D table, 1 = analytic tail,
     2 = the live GH-48 quadrature. Mirrors ref/threshold_cf.cpp
     deficit_branch() and kernels/threshold_cf.cl deficit_branch() exactly,
-    including the NaN case: g <= 0 makes t NaN, every comparison fails, and the
-    quadrature's own guard saturates the deficit at log2(M) -- which is why
-    ln_deficit_* needs no gamma guard on any of the three sides."""
-    t = _t(g, M)
+    including the NaN case: g <= 0 makes t2 <= 0 or NaN, every comparison fails,
+    and the quadrature's own guard saturates the deficit at log2(M) -- which is
+    why ln_deficit_* needs no gamma guard on any of the three sides.
+
+    Note what is no longer here: a lower bound at DFT_TLO. For a tabulated M the
+    table branch covers every 0 < t2 <= DFT_THI^2, and below the grid the clipped
+    lookup returns the low edge (see _dft_lookup). The quadrature is reached only
+    by a dead stream, by a NaN, and by an M the table does not cover."""
+    t2 = _t2(g, M)
     if DFT is not None:
         mi = DFT["index"].get(M, -1)
         if mi >= 0:
-            if DFT["tlo"] <= t <= DFT["thi"]: return 0, mi, t
-            if t > DFT["thi"]: return 1, -1, t
-            return 2, -1, t          # below the grid: GH-48, exact to 1e-9 dB there
-    return (1, -1, t) if t > TQ else (2, -1, t)
+            if t2 > DFT["thi"] * DFT["thi"]: return 1, -1, t2
+            if t2 > 0.0: return 0, mi, t2
+            return 2, -1, t2
+    return (1, -1, t2) if t2 > TQ * TQ else (2, -1, t2)
 
 
 def deficit_fin_quad(g, M):
@@ -198,9 +227,9 @@ def deficit_mod_quad(g, M):
 
 
 def _deficit(mod, g, M):
-    b, mi, t = _branch(g, M)
-    if b == 0: return float(np.exp(_dft_lookup(2 * mi + mod, t)))
-    if b == 1: return float(_c(bool(mod), M) * 0.5 * erfc(t / np.sqrt(2)))
+    b, mi, t2 = _branch(g, M)
+    if b == 0: return float(np.exp(_dft_lookup(2 * mi + mod, t2)))
+    if b == 1: return float(_c(bool(mod), M) * 0.5 * erfc(np.sqrt(t2) / np.sqrt(2)))
     return deficit_mod_quad(g, M) if mod else deficit_fin_quad(g, M)
 
 
@@ -214,14 +243,33 @@ def _ln_deficit(mod, g, M):
     psi() returned nan, and the oracle's safeguarded Newton silently degraded to
     pure bisection. The cf_bench pool reaches t = 143 at its bracket edge, so
     this was live."""
-    b, mi, t = _branch(g, M)
-    if b == 0: return float(_dft_lookup(2 * mi + mod, t))
-    if b == 1: return float(np.log(_c(bool(mod), M)) + _lnQ_asym(t))
+    b, mi, t2 = _branch(g, M)
+    if b == 0: return float(_dft_lookup(2 * mi + mod, t2))
+    if b == 1: return float(np.log(_c(bool(mod), M)) + _lnQ_asym(np.sqrt(t2)))
     return float(np.log(deficit_mod_quad(g, M) if mod else deficit_fin_quad(g, M)))
 
 
 def ln_deficit_fin(g, M): return _ln_deficit(0, g, M)
 def ln_deficit_mod(g, M): return _ln_deficit(1, g, M)
+
+
+def _ln_deficit_t2(mod, t2, M):
+    """ln D keyed on t^2 rather than gamma -- the form psi() uses, mirroring
+    ref/threshold_cf.cpp ln_deficit_t2(). ONE branch selector and ONE
+    interpolation for both keyings: the gamma wrappers above are two lines each,
+    so the hot path and the probe path cannot take different branches at the same
+    physical point. That divergence is what cost 2.78e-5 dB of systematic maxtau
+    once already."""
+    if DFT is not None:
+        mi = DFT["index"].get(M, -1)
+        if mi >= 0:
+            if t2 > DFT["thi"] * DFT["thi"]:
+                return float(np.log(_c(bool(mod), M)) + _lnQ_asym(np.sqrt(t2)))
+            if t2 > 0.0:
+                return float(_dft_lookup(2 * mi + mod, t2))
+            g = 2.0 * t2 / (3.0 / (M - 1))     # dead stream / NaN: the quadrature
+            return float(np.log(deficit_mod_quad(g, M) if mod else deficit_fin_quad(g, M)))
+    return _ln_deficit(mod, 2.0 * t2 / (3.0 / (M - 1)), M)
 
 def _gamma_star(lu, rho, variant, eta):
     if variant == 0:
@@ -241,30 +289,76 @@ def psi(lam, u, M, d, K, variant):
     # made the oracle a *different function* from the C++/kernel -- measured
     # 2.78e-5 dB of systematic tau offset on the cf_bench M=64/d=4/K=8 UCD
     # config, which was the whole of cf_bench's maxtau budget.
-    lf = np.array([ln_deficit_fin(4 * u * l / d2, M) for l in lam.ravel()])
+    # t_i^2 = 2*u*lam_i and t_k^2 = gamma^*_k * k3: the spelling
+    # ref/threshold_cf.cpp psi_u() uses (it hoists cr_i = 2*lam_i per channel).
+    # gamma_i = 4*u*lam_i/d2 followed by t2 = gamma*3/(M-1) is the same number to
+    # within a rounding, but using the hoisted form here is what keeps maxcf and
+    # maxtau comparing one function against itself rather than two near-copies --
+    # the failure mode the note above already paid 2.78e-5 dB for once.
+    k3 = 3.0 / (M - 1)
+    lf = np.array([_ln_deficit_t2(0, u * (2.0 * l), M) for l in lam.ravel()])
     lm = np.array([np.log(float(d)) +
-                   ln_deficit_mod(_gamma_star(lam[k], rho, variant, eta), M)
+                   _ln_deficit_t2(1, _gamma_star(lam[k], rho, variant, eta) * k3, M)
                    for k in range(K)])
     return (lf.max() + np.log(np.exp(lf - lf.max()).sum()) -
             (lm.max() + np.log(np.exp(lm - lm.max()).sum())))
 
 
+# Near-flat fallback grid. These four constants are a copy of
+# kernels/psi_scan.clh, which is compiled into BOTH the kernel and
+# ref/threshold_cf.cpp, so this is the only site that can drift -- and
+# tools/check_capacity.py fails the build when it does (same gate as TQ).
+# PSI_SCAN_N was 401 here and in ref/threshold_cf.cpp against the kernel's 161;
+# all three are 161 now. psi_scan.clh carries the measurement that picked it
+# (tools/cf_scan_ab.py --sweep reproduces the table) and the three
+# counterexamples that killed the 40-step ln-u bisection README's PL list asked
+# for.
+PSI_SCAN_LO = 1e-6
+PSI_SCAN_HI = 1e6
+PSI_SCAN_N = 161
+# fp64 dead band: ref/threshold_cf.cpp's kPsiBand and the kernel's PSI_BAND under
+# #ifdef HPOCL_FP64. The fp32 kernel uses 1e-3 (Psi's own fp32 round-off floor).
+# Usually benign -- README's fallback-scan decision record measures tau moving
+# 0.0000 dB between the two on its 18 degenerate shapes -- but NOT always: on
+# zero2_M64_d2_UCD Psi's only positive excursion peaks at +5.4e-5, above 1e-6 and
+# 19x below 1e-3, so this oracle and the fp64 host say flag 1 / tau = 40.50 dB
+# while the fp32 kernel says flag 2 / tau = +inf. `tools/cf_scan_ab.py --device`
+# reproduces it; cf_bench cannot, it skips near-flat channels before it compares
+# kernel flags.
+PSI_BAND = 1e-6
+
+
 def root_u(lam, M, d, K, variant=0):
     """Newton start point + method flag, mirror of ref/threshold_cf.cpp:
-    0 = closed form (eq. cf), 1 = geometric scan of psi, 2 = no crossing."""
+    0 = closed form (eq. cf), 1 = grid-scan fallback, 2 = no transition.
+
+    Verbatim port of HPOCL_PSI_SCAN in kernels/psi_scan.clh: same endpoints, same
+    point count, same ratio spelling, same dead band, same "last clearly-negative
+    then first clearly-positive" rule and the same arithmetic-midpoint u0. It used
+    to be a private 401-point copy of the kernel's 161-point scan; the two
+    resolutions agreed on tau to 0.0004 dB (README's fallback-scan decision
+    record) because a scan only supplies a Newton start point, and they risked
+    disagreeing on the FLAG, which is a decision (finite tau vs +-inf) and which
+    cf_bench compares for exact equality.
+
+    Unlike the two compiled sides this oracle does NOT apply the
+    whole-spectrum-below-the-grid short circuit, so on a below-grid spectrum it
+    still walks all PSI_SCAN_N points and reaches flag 2 by itself -- the
+    independent check of that proof, at 161 psi evaluations instead of 401.
+    """
     u0, _ = tau_closed_form(lam, M, d, K)
     if u0 is not None:
         return u0, 0
-    lo, ratio, eps = 1e-6, 1e12 ** (1.0 / 400), 1e-6
-    u_neg = None
+    ratio = (PSI_SCAN_HI / PSI_SCAN_LO) ** (1.0 / (PSI_SCAN_N - 1))
+    u, u_neg = PSI_SCAN_LO, None
     with np.errstate(divide="ignore", invalid="ignore"):
-        for _ in range(401):
-            f = psi(lam, lo, M, d, K, variant)
-            if f <= -eps:                       # dead band: near-flat spectra
-                u_neg = lo                      # leave psi at round-off level
-            elif f >= eps and u_neg is not None:
-                return 0.5 * (u_neg + lo), 1
-            lo *= ratio
+        for _ in range(PSI_SCAN_N):
+            f = psi(lam, u, M, d, K, variant)
+            if f <= -PSI_BAND:                  # dead band: near-flat spectra
+                u_neg = u                       # leave psi at round-off level
+            elif f >= PSI_BAND and u_neg is not None:
+                return 0.5 * (u_neg + u), 1     # first transition: Newton start
+            u *= ratio                          # fixed step in ln u
     return None, 2
 
 

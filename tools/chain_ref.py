@@ -7,8 +7,11 @@ power whitening, gauged SVD, cf_ref.tau_policy, DigitalStructuredPrecoder,
 rx_ref.power_scale) -- nothing is re-implemented here. The datapath follows
 the same formulas as tools/datapath_ref.py (gray_standard QAM, log-MAP LLR,
 modulo receiver) and the THP feedback uses thp_precoding.thp_precoder_from_b1.
-The modem stage is cross-checked against the production GMI estimators on
-every run (assert < 1e-6). Emits build/chain_vectors.bin.
+The modem stage is cross-checked against the production GMI estimators on every
+run (assert < 1e-6) -- for all three strategies: SVD/GMD with one call over the
+T streams (they share the scalar floor n0), MMSE-UCD one stream at a time (its
+floor is n0*||Q_j||^2 and production's estimators take a single scalar snr).
+Emits build/chain_vectors.bin.
 
 Binary layout, little endian throughout:
   int32 ncase
@@ -156,6 +159,13 @@ def build_case(spec, rng):
     y = np.einsum("kra,as->krs", H, x) + n             # [K, Nr, nsym]
 
     # ---- receive datapath --------------------------------------------------
+    # MMSE-UCD noise gain per stream, ||Q_k col j||^2. w_ucd has unit GAIN (Q^H G
+    # carries a unit diagonal, which is why the UCD branch does not divide by
+    # diagb below) but NOT unit norm -- measured 0.0853..0.0931 on the UCD case --
+    # so the post-combiner noise floor is n0*qn, not n0. Computed once here
+    # because the LLR stage and the production cross-check must demodulate with
+    # the same floor; two copies of this sum would be two chances to disagree.
+    qn = (np.abs(Q) ** 2).sum(axis=1)                  # [K,d]
     z = np.vstack([Q[k].conj().T @ y[k] for k in range(K)])   # [T, nsym]
     if mode == 0 or variant == 0:                      # UCD: w_ucd pre-normalised
         z = z / diagb.reshape(-1, 1)
@@ -169,7 +179,6 @@ def build_case(spec, rng):
         if variant == 0:
             llr = soft_llr(zf.reshape(-1), cand, clab, n0).reshape(T, nsym, m)
         else:                                          # per-stream noise floor
-            qn = (np.abs(Q) ** 2).sum(axis=1)          # [K,d] = ||Q_k col j||^2
             llr = np.empty((T, nsym, m))
             for st in range(T):
                 k, j = st // d, st % d
@@ -177,12 +186,15 @@ def build_case(spec, rng):
     gmi = gmi_per_stream(llr, bits, m)                 # [T]
     ber = ber_per_stream(llr, bits)                    # [T]
 
-    # ---- production GMI cross-check (modem part; scalar-n0 branches) ------
+    # ---- production GMI cross-check (modem stage vs bicm_metrics) ----------
+    # Label -> constellation index, which is what the production estimators take
+    # as symbol_indices (they look the labels up in their own table).
+    mh = m // 2
+    w = 1 << np.arange(mh - 1, -1, -1)
+    lvl = (gray_decode((bits[..., :mh] * w).sum(-1)) * (1 << mh)
+           + gray_decode((bits[..., mh:] * w).sum(-1)))          # [T, nsym]
     if variant == 0:
-        mh = m // 2
-        w = 1 << np.arange(mh - 1, -1, -1)
-        lvl = (gray_decode((bits[..., :mh] * w).sum(-1)) * (1 << mh)
-               + gray_decode((bits[..., mh:] * w).sum(-1)))
+        # One scalar noise floor for all T streams, so one call covers them.
         if mode == 0:
             prod = estimate_bicm_gmi_parallel_from_received(
                 np.ones(T, complex), 1.0 / n0, m, lvl.T, (z.T) / np.sqrt(n0))
@@ -198,8 +210,25 @@ def build_case(spec, rng):
         # contract (see kernels/datapath.cl gmi_k), so the clamp belongs here.
         agg = max(0.0, float(gmi.sum()))
         assert abs(prod - agg) < 1e-6, (spec, prod, agg)
+    elif mode == 1:
+        # MMSE-UCD: production's estimators take ONE snr_per_stream for the whole
+        # call, and this branch's floor is per stream, so it is checked one
+        # stream at a time with that stream's own snr = 1/(n0*qn). With a single
+        # stream ideal_rate is 1*m, i.e. production returns the per-stream GMI
+        # (still clamped at zero, hence the max()). This branch used to be
+        # skipped, so the per-stream noise floor was only ever compared against
+        # our own two implementations -- self-consistent, not independent.
+        for st in range(T):
+            k, j = st // d, st % d
+            prod_st = estimate_bicm_gmi_thp_from_received(
+                np.ones(1, complex), 1.0 / (n0 * qn[k, j]), m,
+                lvl[st].reshape(-1, 1), zf[st].reshape(-1, 1),
+                replica_radius=RADIUS)
+            assert prod_st > 0.05, (spec, st, prod_st)
+            assert abs(prod_st - max(0.0, float(gmi[st]))) < 1e-6, \
+                (spec, st, prod_st, float(gmi[st]))
 
-    return dict(K=K, Nt=Nt, Nr=Nr, NRF=NRF, d=d, M=M, variant=variant,
+    return dict(K=K, Nt=Nt, Nr=Nr, NRF=NRF, d=d, M=M, m=m, variant=variant,
                 nul=nul, nsym=nsym, s_db=s_db, tau=float(tau), pscale=pscale,
                 mode=mode,
                 bits=bits, H=H, Frf=Frf, Fbb=Fbb, Q=Q, R=R, diagb=diagb, B=B,
@@ -245,7 +274,7 @@ def main():
             out.append(a.tobytes())
         print(f"  case K={c['K']} var={c['variant']} s={c['s_db']}dB "
               f"tau={c['tau']:.3f}dB mode={c['mode']} "
-              f"GMI={c['gmi'].mean():.4f}/{c['M']}")
+              f"GMI={c['gmi'].mean():.4f}/{c['m']} bits/symbol")
     pathlib.Path("build").mkdir(exist_ok=True)
     blob = b"".join(out)
     pathlib.Path("build/chain_vectors.bin").write_bytes(blob)
