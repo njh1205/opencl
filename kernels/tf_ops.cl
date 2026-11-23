@@ -1,30 +1,13 @@
-//-----------------------------------------------------------------------------
-// operator family: tf_*  -- inference operators for the spectral set
-// transformer threshold predictor (SpectralSetTransformerThresholdRegressor
-// in mix_precode/ai/learn_svd_ucd_threshold.py).
-//
-//   tokens [T][token_dim]  + config [config_dim]
-//     -> token/config projections (Linear,GELU,Linear) + broadcast add
-//     -> L x (masked self-attention + LayerNorm) residual blocks
-//     -> masked attention pooling -> shared head -> threshold head
-//     -> sign-condition head over P probe SNR points
-//
-// Every operator is a plain data-parallel kernel: on PL they synthesise to
-// pipelined MAC arrays; on CPU/GPU OpenCL they are the validation path.
-// fp32 only (inference datapath), exactly like the deployed PL build.
-//-----------------------------------------------------------------------------
+// tf_ops.cl: fp32 inference kernels for the spectral-set transformer threshold predictor:
+// dense, GELU, broadcast add, mask multiply, LayerNorm, masked self-attention, masked pooling, sign-pack, add.
 #pragma OPENCL EXTENSION cl_khr_fp64 : disable
 
-// Capacity. tf_attn/tf_pool keep a per-work-item score scratch indexed by the
-// token count T, and T arrives from the weight-file header, so it must be
-// bounded here. TF_TMAX has to match kTfTMax in
-// runtime/transformer_predictor.h -- the host already rejects a larger T in
-// load() (and a heads that does not divide d_model), so the guards below are
-// defence in depth rather than the primary gate.
+// TF_TMAX bounds per-work-item score scratch; must match kTfTMax in runtime/transformer_predictor.h (host rejects larger T)
 #ifndef TF_TMAX
 #define TF_TMAX 64
 #endif
 
+// tf_dense: X[B][in] x W[out][in] + b[out] -> Y[B][out] (linear projection)
 __kernel void tf_dense(__global const float* restrict X,   // [B][in]
                        __global const float* restrict W,   // [out][in]
                        __global const float* restrict b,   // [out]
@@ -41,6 +24,7 @@ __kernel void tf_dense(__global const float* restrict X,   // [B][in]
   Y[(size_t)bb * out + o] = acc;
 }
 
+// tf_gelu: Y = 0.5 * x * (1 + erf(x/sqrt(2))) elementwise
 __kernel void tf_gelu(__global const float* restrict X, int n,
                       __global float* restrict Y) {
   int i = get_global_id(0);
@@ -49,6 +33,7 @@ __kernel void tf_gelu(__global const float* restrict X, int n,
   Y[i] = 0.5f * x * (1.0f + erf(x * 0.70710678118654752f));
 }
 
+// tf_add_broadcast: Y = A + b, bias broadcast over rows
 __kernel void tf_add_broadcast(__global const float* restrict A,  // [T][d]
                                __global const float* restrict b,  // [d]
                                int T, int d,
@@ -58,6 +43,7 @@ __kernel void tf_add_broadcast(__global const float* restrict A,  // [T][d]
   Y[i] = A[i] + b[i % d];
 }
 
+// tf_mul_mask: Y = A * m, mask broadcast over rows
 __kernel void tf_mul_mask(__global const float* restrict A,   // [T][d]
                           __global const float* restrict m,   // [T]
                           int T, int d,
@@ -67,6 +53,7 @@ __kernel void tf_mul_mask(__global const float* restrict A,   // [T][d]
   Y[i] = A[i] * m[i / d];
 }
 
+// tf_layernorm: per-token (x - mu) / sqrt(var + eps) * g + bb
 __kernel void tf_layernorm(__global const float* restrict X,  // [T][d]
                            __global const float* restrict g,  // [d]
                            __global const float* restrict bb, // [d]
@@ -86,8 +73,7 @@ __kernel void tf_layernorm(__global const float* restrict X,  // [T][d]
     Y[(size_t)t * d + i] = (x[i] - mu) * rs * g[i] + bb[i];
 }
 
-// masked self-attention, one work-item per (query, head):
-//   out[q][h*dh:(h+1)*dh] = sum_k softmax_c(qk/sqrt(dh) + mask) * V[k][h slice]
+// tf_attn: masked self-attention, one work-item per (query, head); out = sum_k softmax(qk/sqrt(dh)+mask) * V
 __kernel void tf_attn(__global const float* restrict Q,   // [T][d]
                       __global const float* restrict K,   // [T][d]
                       __global const float* restrict V,   // [T][d]
@@ -121,11 +107,7 @@ __kernel void tf_attn(__global const float* restrict Q,   // [T][d]
   }
 }
 
-// masked attention pooling: global = sum_t softmax_t(pool(h_t)) * h_t
-// Single work-item by construction: the host launches gws = {1} (see
-// runtime/transformer_predictor.cpp), and the gid guard below makes a wider
-// launch a no-op instead of a wrong reduction. Two serial passes (scores, then
-// the weighted sum); on PL this becomes one small FSM-driven reduce unit.
+// tf_pool: masked attention pooling, single work-item (gws == {1}); global = sum_t softmax(pool(h_t)) * h_t
 __kernel void tf_pool(__global const float* restrict H,   // [T][d]
                       __global const float* restrict w,   // [d]
                       float bp,
@@ -153,7 +135,7 @@ __kernel void tf_pool(__global const float* restrict H,   // [T][d]
   }
 }
 
-// sign-condition head input pack: [P][d+3] = [shared_state, snr, snr^2, 1]
+// tf_sign_pack: pack [state | snr/scale | (snr/scale)^2 | 1] per probe -> Y[P][d+3]
 __kernel void tf_sign_pack(__global const float* restrict state,  // [d]
                            __global const float* restrict snr,    // [P]
                            int P, int d, float scale,
@@ -171,6 +153,7 @@ __kernel void tf_sign_pack(__global const float* restrict state,  // [d]
   Y[(size_t)p * (d + 3) + i] = v;
 }
 
+// tf_add_elem: Y = A + B elementwise
 __kernel void tf_add_elem(__global const float* restrict A,
                           __global const float* restrict B, int n,
                           __global float* restrict Y) {

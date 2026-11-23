@@ -1,0 +1,44 @@
+// psi_scan.clh — near-flat fallback root search for the closed-form SVD/THP
+// threshold: the u range, the grid resolution, and the scan itself; shared by
+// device kernels/threshold_cf.cl, host ref/threshold_cf.cpp and oracle tools/cf_ref.py.
+// HPOCL_PSI_SCAN_CLH: include guard.
+#ifndef HPOCL_PSI_SCAN_CLH
+#define HPOCL_PSI_SCAN_CLH
+
+// PSI_SCAN_LO / PSI_SCAN_HI: u range the fallback searches; spans tau = -36..+84
+// dB at M = 64, T = 32 (PSI_SCAN_HI also bounds the below-grid short circuit).
+#define PSI_SCAN_LO 1e-6
+#define PSI_SCAN_HI 1e6
+
+// PSI_SCAN_N: grid points incl. both endpoints; fixed step in ln u of
+// 12/(PSI_SCAN_N-1) decades. 161 = the legacy fp32-kernel resolution, kept equal
+// across device, host ref and oracle.
+#define PSI_SCAN_N 161
+
+// HPOCL_PSI_SCAN: walk the grid, remember the last u with Psi <= -BAND, stop at
+// the first later u with Psi >= +BAND; u0 = arithmetic midpoint = Newton start.
+// R = scalar type, PSI_EXPR = Psi(psa_u) expression, BAND = dead band; U0_OUT /
+// OK_OUT = lvalues (OK_OUT 0 = no root found -> caller saturates). Macro, not a
+// function: OpenCL C has no function pointers, and device/ref use scalar types.
+#define HPOCL_PSI_SCAN(R, PSI_EXPR, BAND, U0_OUT, OK_OUT)                     \
+  do {                                                                        \
+    R psa_ratio = pow((R)PSI_SCAN_HI / (R)PSI_SCAN_LO,                        \
+                      (R)1 / (R)(PSI_SCAN_N - 1));                            \
+    R psa_uneg = (R)-1;              /* last u with Psi <= -BAND, -1 = none */ \
+    R psa_u = (R)PSI_SCAN_LO, psa_f;                                          \
+    int psa_j;                                                                \
+    (OK_OUT) = 0;                                                             \
+    for (psa_j = 0; psa_j < PSI_SCAN_N; ++psa_j) {                            \
+      psa_f = (PSI_EXPR);                                                     \
+      if (psa_f <= -(BAND)) {                    /* clearly SVD-favouring */   \
+        psa_uneg = psa_u;                                                     \
+      } else if (psa_f >= (BAND) && psa_uneg > (R)0) {   /* first crossing */  \
+        (U0_OUT) = (R)0.5 * (psa_uneg + psa_u);                               \
+        (OK_OUT) = 1;                                                         \
+        break;                                                                \
+      }                                                                       \
+      psa_u *= psa_ratio;                        /* fixed step in ln u */     \
+    }                                                                         \
+  } while (0)
+
+#endif  // HPOCL_PSI_SCAN_CLH

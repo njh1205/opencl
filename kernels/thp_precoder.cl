@@ -1,21 +1,11 @@
-//-----------------------------------------------------------------------------
-// operator: thp_precoder  (Tomlinson-Harashima branch)
-//   b[k] = mod_tau( x[k] - sum_{j<k} B[k][j] b[j] )     sequential feedback
-//   y    = F b                                          feedforward
-// The feedback loop is inherently serial, so one work-item owns one
-// subcarrier and walks the K streams in order -- the same "recurrent kernel"
-// pattern used for KV-cache update kernels on GPU inference runtimes.
-//-----------------------------------------------------------------------------
-#include "cplx.clh"        // cmul / csub / cmod: shared with the rest of the datapath
+// thp_precoder.cl: Tomlinson-Harashima precoding - b = mod_tau(x - sum_{j<k} B[k][j] b[j]), y = F b.
+// One work-item per subcarrier walks the K streams in order (the feedback loop is serial).
+#include "cplx.clh"        // cmul/csub/cmod/cmac
 
-// KMAX bounds the per-work-item feedback history b[KMAX]; the host passes K
-// straight through, so an oversized K is rejected here rather than overflowing
-// private memory. Runtime::thp_precoder refuses K > KMAX host-side (and
-// NaN-fills Y), so this branch is defence in depth for any other caller -- and
-// it writes a sentinel for the same reason: an untouched Y is indistinguishable
-// from a legitimate one. tools/check_capacity.py keeps the two KMAX values equal.
+// KMAX bounds per-work-item b[]; host enforces K <= KMAX too (defence in depth), NaN-fills Y otherwise
 #define KMAX 16
 
+// thp_precoder: B[K][K], F[M][K], X[SC][K] -> Y[SC][M]; sequential THP feedback + feedforward, one subcarrier per work-item.
 __kernel void thp_precoder(__global const float2* restrict B,   // [K][K] fb
                            __global const float2* restrict F,   // [M][K] ff
                            __global const float2* restrict X,   // [SC][K]

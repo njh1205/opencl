@@ -1,74 +1,42 @@
-//-----------------------------------------------------------------------------
-// mcs_table.clh -- the one definition of the modulation-and-coding (MCS / CQI)
-// table and of the code-rate selection rule, compiled into BOTH sides:
-//   host   : runtime/rate_main.cpp        (via -Ikernels, so the fp64/fp32
-//                                          reference and the kernel share text)
-//   device : kernels/rate.cl              (via Runtime's include inliner)
-//
-// Why this file exists: yang_unified_transceiver (the MART paper this stack
-// implements the control plane of) is a MIMO-BICM model -- information bits are
-// FEC-encoded at a code rate R, interleaved, then grouped into q-bit labels of
-// an M = 2^q QAM constellation. Its achievable-rate bound is evaluated for a
-// GIVEN "modulation and coding scheme" ("a^2 is a constant, as data packets are
-// typically transmitted under a given modulation and coding scheme"), i.e. the
-// code rate is an outer parameter of the transceiver design, not something the
-// precoder optimises. This header is that outer parameter, as a table.
-//
-// The selection rule is the standard GMI-based adaptive-modulation-and-coding
-// test: with GMI the mutual information per *coded* symbol (bits, what
-// kernels/datapath.cl::gmi_k produces), a pair (m, R) is supportable iff
-//     R * m  <=  GMI        <=>        SE = m * R / 1024  <=  GMI.
-// Pick the largest such entry and the link runs at the highest spectral
-// efficiency its measured GMI can carry; none matching is an outage.
-//
-// Plain C arithmetic only, so the same text is valid OpenCL C and C++.
-//-----------------------------------------------------------------------------
+// mcs_table.clh — 3GPP TS 38.214 64QAM CQI (MCS) table and the GMI-based
+// code-rate selection rule; shared by host runtime/rate_main.cpp and device
+// kernels/rate.cl.
+// HPOCL_MCS_TABLE_CLH: include guard.
 #ifndef HPOCL_MCS_TABLE_CLH
 #define HPOCL_MCS_TABLE_CLH
 
-// 3GPP TS 38.214 Table 5.2.2.1-2 (the 64QAM "CQI table"): index -> modulation
-// order m and code rate R in units of 1/1024. Index 0 is "out of range", so it
-// carries m = R = 0 and is never selected. SE is monotone non-decreasing in the
-// index, which is what makes cqi_select's linear scan a maximum.
+// HPOCL_CQI_N: table size; index 0 is "out of range" (m = R = 0, never
+// selected). SE is monotone non-decreasing, so a linear scan is a maximum.
 #define HPOCL_CQI_N 16
+// HPOCL_RATE_DEN: code-rate units, 1/1024 (SE = m * R / 1024).
 #define HPOCL_RATE_DEN 1024
 
-// OpenCL C requires a program-scope initialised array to live in the __constant
-// address space; C++ has no such qualifier, so the storage class is spelled per
-// language. `static const` on the host gives each translation unit its own copy
-// (internal linkage, no ODR issue); `__constant` on the device puts one copy in
-// the read-only section, which on the PL maps to BRAM instead of arguments.
+// HPOCL_TBL: storage class — __constant in OpenCL C (read-only, maps to BRAM),
+// static const in C++ (per-TU copy, internal linkage, no ODR issue).
 #ifdef __OPENCL_C_VERSION__
 #define HPOCL_TBL __constant
 #else
 #define HPOCL_TBL static const
 #endif
+// kCqiM: CQI index -> modulation order m.
 HPOCL_TBL int kCqiM[HPOCL_CQI_N] = {0, 2, 2, 2, 2, 2, 2,
                                     4, 4, 4, 6, 6, 6, 6, 6, 6};
+// kCqiR: CQI index -> code rate R in units of 1/1024.
 HPOCL_TBL int kCqiR[HPOCL_CQI_N] = {0, 78, 120, 193, 308, 449, 602,
                                     378, 490, 616, 466, 567, 666, 772, 873, 948};
 
-// spectral efficiency of CQI index j in bits per channel use, m*R/1024
+// cqi_se: spectral efficiency of CQI index j, m * R / 1024 bits/channel use;
+// 0 if j is out of range.
 static inline float cqi_se(int j) {
   if (j < 0 || j >= HPOCL_CQI_N) return 0.0f;
   return (float)kCqiM[j] * (float)kCqiR[j] / (float)HPOCL_RATE_DEN;
 }
 
-// Highest supportable CQI index for a measured GMI, or -1 on outage. `eps` is a
-// selection slack in bits: a stream sitting exactly on an entry's SE must get
-// that entry, and fp32 GMI carries ~1e-6 of rounding, so ties resolve upward
-// only within eps. Scanning upward and keeping the last match is O(16) and
-// branch-free enough for the PL, and needs no monotonicity proof to be correct.
-// GMI is bounded above by the modulation order (m <= 8 bits/symbol in this
-// stack, kernels/datapath.cl::MMAX = 256), so anything outside
-// [-HPOCL_GMI_MAX, HPOCL_GMI_MAX] is not a measurement but an upstream fault:
-// n0 == 0 makes the LLR infinite, and a NaN propagates out of the demodulator.
-// Selecting the top MCS from +inf would schedule a rate the link cannot carry;
-// silently selecting the bottom one would hide the fault. Both are refusals, so
-// the caller sees it in the outage counter instead of in a plausible-looking
-// rate. Written as two negated comparisons so no library isfinite/isnan is
-// needed and the same text is valid OpenCL C and C++.
+// HPOCL_GMI_MAX: GMI upper bound = max modulation order (8 bits/symbol); values
+// above it are upstream faults, not measurements (refused, not scheduled).
 #define HPOCL_GMI_MAX 8.0f
+// cqi_select: highest CQI index with SE <= gmi + eps, or -1 on outage; eps is a
+// slack that resolves fp32 ties upward; -1 also rejects NaN, <= 0 and +inf.
 static inline int cqi_select(float gmi, float eps) {
   if (!(gmi > 0.0f)) return -1;              // rejects NaN and <= 0
   if (!(gmi <= HPOCL_GMI_MAX)) return -1;    // rejects +inf (and NaN again)
@@ -78,10 +46,8 @@ static inline int cqi_select(float gmi, float eps) {
   return best;
 }
 
-// Information rate actually delivered, in bits per channel use: the selected
-// code rate times the modulation order, capped by the GMI it has to fit inside.
-// Zero on outage. This -- not the GMI -- is the quantity a scheduler sums over
-// streams and divides by N_t to get bits/s/Hz.
+// cqi_info_rate: delivered information rate, min(SE(j), gmi) bits/channel use;
+// 0 on outage or out of range (capped: R * m <= GMI is the support condition).
 static inline float cqi_info_rate(float gmi, int j) {
   if (j < 0 || j >= HPOCL_CQI_N) return 0.0f;
   float se = cqi_se(j);

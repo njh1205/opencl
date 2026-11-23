@@ -16,11 +16,17 @@
 #   datapath_bench   fp32 PL datapath kernels vs numpy reference
 #   datapath_pl_bench the same datapath with PL build options (LLR recompute path)
 #   rate_bench       code-rate/MCS layer: numpy oracle vs host .clh vs fp32 kernel
+#   fec_bench        FEC layer (CRC/conv encoder/puncturer/interleaver/Viterbi):
+#                    numpy oracle vs host C++ vs exhaustive 2^L enumeration
 #   chain_bench      end-to-end fp32 kernel chain vs numpy reference
 #   tf_bench         transformer threshold predictor vs numpy reference
 #   gh_check         Gauss-Hermite table: host header vs device header in sync
 #   registry_check   every kernel is in the host registry, PL-linked, and called
-#   capacity_check   shared constants (PMAX/MAXM/MAXD/KMAX/MMAX/TQ/...) in step
+#   glue_cost_check  the glue-offload cost rule re-derived at all 21 pool configs
+#   capacity_check   shared constants (PMAX/the per-kernel decomp ceilings/
+#                    KMAX/MMAX/TQ/...) in step, AND every bench geometry plus all
+#                    21 configs in mix_precode/*/config_pools checked to fit them
+#                    and to be RF-BD feasible ((K-1)*Nr < min(Nt,NRF))
 #   deficit_check    generated ln D table: host vs device, Lemma-4, tail handover
 #   allprog_check    every kernel source builds as ONE program, all kernels acquired
 #   asan_check       host-only benches rebuilt with ASan+UBSan and re-run
@@ -32,13 +38,17 @@ CXX ?= c++
 UNAME := $(shell uname)
 ifeq ($(UNAME),Darwin)
 CL_LIB := -framework OpenCL
+THREAD_FLAGS :=
 else
 CL_LIB := -lOpenCL
+# std::thread needs -pthread on the deployed Linux/A53 toolchain (and on older
+# glibc-based development hosts); macOS links it through libSystem instead.
+THREAD_FLAGS := -pthread
 endif
 # -Ikernels lets the host reference share the device headers (switch_law.clh),
 # so one definition of a formula is compiled into both sides.
 INC  := -Iinclude -Iref -Iruntime -Ikernels
-CXXF := -O2 -std=c++17 -Wall -Wextra $(INC)
+CXXF := -O2 -std=c++17 -Wall -Wextra $(THREAD_FLAGS) $(INC)
 # dependency generation is a *compile*-only flag: passing -MMD to the link step
 # makes clang try to emit one .d per input object and fail.
 DEPFLAGS := -MMD -MP
@@ -50,21 +60,36 @@ DEV  ?= cpu
 # cl.init call in the corresponding runtime/*_main.cpp)
 K_OP    := kernels/channel_cov.cl kernels/power_iter.cl kernels/switch_threshold.cl \
            kernels/wbb_apply.cl kernels/thp_precoder.cl
-K_CF    := kernels/threshold_cf.cl kernels/gh_table.clh kernels/deficit_table.clh
+# psi_scan.clh is listed because threshold_cf.cl #includes it: the Runtime inlines
+# .clh text at every run, but the LINK RULE's prerequisites are what make `make`
+# rebuild a bench after a header edit, and -MMD only tracks the host side.
+K_CF    := kernels/threshold_cf.cl kernels/psi_scan.clh kernels/gh_table.clh \
+           kernels/deficit_table.clh
 K_DECOMP:= kernels/decomp.cl
 K_PATH  := kernels/datapath.cl kernels/rate.cl kernels/mcs_table.clh
 K_CHAIN := kernels/datapath.cl kernels/thp_precoder.cl
 K_TF    := kernels/tf_ops.cl
 K_RATE  := kernels/rate.cl kernels/mcs_table.clh
+# wbb_apply.cl is here because sched_bench's device role now offloads the three
+# Nt-class glue GEMMs (H F_RF, F_RF N_k, F_RF F_BB) through it -- without the
+# source in the program, Runtime::has_kernel("wbb_apply") is false and the glue
+# provider silently keeps every site on the PS, which is a bench that passes
+# while testing nothing (exactly the failure mode registry_check exists for).
+K_SCHED := kernels/decomp.cl kernels/threshold_cf.cl kernels/psi_scan.clh \
+           kernels/gh_table.clh kernels/deficit_table.clh kernels/wbb_apply.cl
 
 # Per-bench translation units. Named here once because two targets need the same
 # list: the normal link rule and `asan_check`, which rebuilds them with
 # sanitizers. A list typed twice is a list that drifts.
-SRC_pipeline := ref/pipeline.cpp ref/frontend.cpp ref/decomp.cpp ref/threshold_cf.cpp ref/rx.cpp runtime/pipeline_main.cpp
+SRC_pipeline := ref/pipeline.cpp ref/frontend.cpp ref/decomp.cpp ref/threshold_cf.cpp ref/rx.cpp \
+                runtime/hpocl_executor.cpp runtime/pipeline_main.cpp
 SRC_rx       := ref/rx.cpp ref/decomp.cpp runtime/rx_main.cpp
 SRC_frontend := ref/frontend.cpp ref/decomp.cpp runtime/frontend_main.cpp
 SRC_modem    := ref/modem.cpp runtime/modem_main.cpp
+SRC_fec      := ref/fec.cpp runtime/fec_main.cpp
 SRC_lmmse    := ref/threshold_cf.cpp runtime/lmmse_main.cpp
+SRC_sched    := ref/pipeline.cpp ref/frontend.cpp ref/decomp.cpp ref/threshold_cf.cpp \
+                ref/rx.cpp runtime/hpocl_executor.cpp runtime/hpocl_schedule.cpp $(RT) runtime/sched_main.cpp
 
 # One .o per translation unit, so -MMD emits a *complete* .d per TU. (Compiling
 # several .cpp in a single command writes only the first TU's headers to the .d,
@@ -99,6 +124,8 @@ $(eval $(call link_rule,tf_bench,$(RT) runtime/transformer_predictor.cpp runtime
 $(eval $(call link_rule,modem_bench,$(SRC_modem),,))
 $(eval $(call link_rule,datapath_bench,$(RT) runtime/datapath_main.cpp,$(K_PATH),$(CL_LIB)))
 $(eval $(call link_rule,rate_bench,$(RT) runtime/rate_main.cpp,$(K_RATE),$(CL_LIB)))
+$(eval $(call link_rule,fec_bench,$(SRC_fec),,))
+$(eval $(call link_rule,sched_bench,$(SRC_sched),$(K_SCHED),$(CL_LIB)))
 $(eval $(call link_rule,allprog_check,$(RT) runtime/allprog_main.cpp,$(K_ALL),$(CL_LIB)))
 
 cf_ref: | build
@@ -142,14 +169,42 @@ datapath_bench: build/datapath_bench
 
 # Same binary, PL build options: -DLLR_CACHE_MAX=4 shrinks softdemod_llr_k's
 # private candidate cache to 16 B and therefore routes every m >= 6 case through
-# its recompute fallback. The fabric runs that path, so gate it -- a fallback
-# nobody tests is where a second implementation goes to drift.
+# its recompute fallback, and -DTXC_LOCAL_MAX=4 makes tx_combine_k's local tile
+# unreachable so every case takes its untiled path. The fabric runs those paths
+# (or a BRAM-budget variant of them), so gate them -- a fallback nobody tests is
+# where a second implementation goes to drift. The third run has both, because
+# "each fallback is gated alone" is not the same as "they compose".
 datapath_pl_bench: build/datapath_bench
 	HPOCL_CLOPTS=-DLLR_CACHE_MAX=4 ./build/datapath_bench build/datapath_vectors.bin $(DEV)
+	HPOCL_CLOPTS=-DTXC_LOCAL_MAX=4 ./build/datapath_bench build/datapath_vectors.bin $(DEV)
+	HPOCL_CLOPTS="-DLLR_CACHE_MAX=4 -DTXC_LOCAL_MAX=4" ./build/datapath_bench build/datapath_vectors.bin $(DEV)
 
 rate_bench: build/rate_bench
 	$(PY) tools/rate_ref.py
 	./build/rate_bench build/rate_vectors.bin $(DEV)
+
+# The FEC layer the (m, R) table above selects but does not implement: CRC-24A /
+# CRC-16, the (133,171)_8 K=7 rate-1/2 convolutional encoder punctured to 2/3 and
+# 3/4, an S-random interleaver, and a soft-decision Viterbi. Three-way where a
+# third way exists -- numpy oracle (GF(2)[x] division CRC, generator-matrix
+# encoder, batched trellis) vs host C++ (LFSR + byte table, shift register, scalar
+# 64-state Viterbi) vs exhaustive enumeration of all 2^L codewords on the small
+# frames. HOST ONLY: no OpenCL, no device, no kernel, so this is the one bench in
+# `check` that also runs where the ICD is missing. 40 gates, 0.05 s measured.
+fec_bench: build/fec_bench
+	$(PY) tools/fec_ref.py
+	./build/fec_bench build/fec_vectors.bin
+
+# The DEVICE ROLE of one scheduling instant against the PS role: the same
+# front_end()/design_instant() bodies, with the decompositions and the threshold
+# as batched kernels. Each case runs twice -- once with the cost rule deciding
+# which SVD batches are worth a launch, once with force=true launching all of
+# them -- so the device path is gated on the shapes that pay for themselves AND
+# on the ones that do not. No numpy oracle: the host role is already three-way
+# gated against production python by pipeline_bench, and this gate is the link
+# from that to the kernels.
+sched_bench: build/sched_bench
+	./build/sched_bench $(DEV)
 
 rx_bench: build/rx_bench
 	$(PY) tools/rx_ref.py
@@ -169,9 +224,19 @@ chain_bench: build/chain_bench
 # because Runtime::build concatenates its sources into a single translation unit
 # (and the PL link does the same across .xo files).
 K_ALL := $(wildcard kernels/*.cl)
+# Three configurations, because each one is a different deployment and each has
+# failed differently in the past: (1) the device default, which is now fp32
+# everywhere (threshold_cf.cl inverted its default when the PL footgun was
+# fixed); (2) -DHPOCL_FP32 forced, i.e. exactly what build_xclbin.sh passes, so
+# the gate builds what the board builds; (3) -DWBB_LOCAL_MAX=4096, the PL's
+# wbb_apply tile, whose 32 KB of __local is checked against the device's
+# CL_DEVICE_LOCAL_MEM_SIZE -- on this host that limit is exactly 32 768 B, so the
+# tiled path fits with ZERO bytes to spare and a device that reserves any local
+# memory would fail the launch rather than run slowly.
 allprog_check: build/allprog_check
 	./build/allprog_check $(DEV)
 	HPOCL_CLOPTS=-DHPOCL_FP32 ./build/allprog_check $(DEV)
+	HPOCL_CLOPTS="-DHPOCL_FP32 -DWBB_LOCAL_MAX=4096" ./build/allprog_check $(DEV)
 
 # Sanitizer pass over the host-only benches (the ones that need no OpenCL
 # device). The fp64 references in ref/ are the oracles every kernel is judged
@@ -182,7 +247,12 @@ allprog_check: build/allprog_check
 # pointer arithmetic over a byte buffer with sizes read from the file, which is
 # exactly where an out-of-contract offset would hide.
 SANF := -fsanitize=address,undefined -fno-omit-frame-pointer -g
-SAN_BENCHES := pipeline_bench rx_bench frontend_bench modem_bench lmmse_bench
+# fec_bench is host-only (no OpenCL, no device), so it belongs here exactly as
+# much as the other five: it is a pure-C++ reference whose buffers the sanitizer
+# can actually check, and its gates are the ones that read a byte buffer with sizes
+# taken from the vector file.
+SAN_BENCHES := pipeline_bench rx_bench frontend_bench modem_bench lmmse_bench \
+               fec_bench
 asan_check: | build
 	@mkdir -p build/asan
 	@set -e; for pair in \
@@ -190,7 +260,8 @@ asan_check: | build
 	    "rx_bench:$(SRC_rx):rx_vectors.bin:$(PY) tools/rx_ref.py" \
 	    "frontend_bench:$(SRC_frontend):frontend_vectors.bin:$(PY) tools/frontend_ref.py" \
 	    "modem_bench:$(SRC_modem):modem_vectors.bin:$(PY) tools/modem_ref.py" \
-	    "lmmse_bench:$(SRC_lmmse):lmmse_vectors.bin:$(PY) tools/lmmse_ref.py"; do \
+	    "lmmse_bench:$(SRC_lmmse):lmmse_vectors.bin:$(PY) tools/lmmse_ref.py" \
+	    "fec_bench:$(SRC_fec):fec_vectors.bin:$(PY) tools/fec_ref.py"; do \
 	  b=$$(echo "$$pair" | cut -d: -f1); src=$$(echo "$$pair" | cut -d: -f2); \
 	  vec=$$(echo "$$pair" | cut -d: -f3); gen=$$(echo "$$pair" | cut -d: -f4-); \
 	  echo "[asan] building $$b"; \
@@ -248,6 +319,15 @@ gh_gen:
 capacity_check:
 	$(PY) tools/check_capacity.py
 
+# The glue-offload cost rule (runtime/hpocl_schedule.{h,cpp}) is a one-line flops
+# proxy for a four-constant time model. This gate re-derives all 63 site decisions
+# (3 glue GEMMs x the 21 distinct configs in mix_precode/*/config_pools) from the
+# constants in the header and fails if the proxy and the model disagree, so the
+# rule cannot drift from the derivation that justifies it. Text + arithmetic only:
+# no build, no device.
+glue_cost_check:
+	$(PY) tools/glue_cost_table.py --quiet
+
 # Deployed transformer path: real checkpoint -> flat binary -> OpenCL graph.
 # Skips itself when the archived checkpoint is absent. TF_CKPT=/path/model.pt
 # overrides the default location.
@@ -257,8 +337,8 @@ tf_export_check: build/tf_bench
 # cf_ref writes build/cf_vectors.bin which cf_bench reads: never run in parallel.
 .NOTPARALLEL:
 
-check: gh_check registry_check capacity_check deficit_check allprog_check cf_bench op_bench op_pl_bench tf_bench tf_export_check decomp_bench frontend_bench \
-       pipeline_bench modem_bench datapath_bench datapath_pl_bench rate_bench rx_bench lmmse_bench chain_bench \
+check: gh_check registry_check capacity_check glue_cost_check deficit_check allprog_check cf_bench op_bench op_pl_bench tf_bench tf_export_check decomp_bench frontend_bench \
+       pipeline_bench sched_bench modem_bench datapath_bench datapath_pl_bench rate_bench fec_bench rx_bench lmmse_bench chain_bench \
        asan_check
 	@echo "[hpocl] all checks done"
 
@@ -275,6 +355,7 @@ help:
 	@echo "  gh_check      verify host/device Gauss-Hermite tables agree"
 	@echo "  registry_check verify every kernel is registered, PL-linked, called"
 	@echo "  capacity_check verify shared constants agree across kernel/host/oracle"
+	@echo "  glue_cost_check re-derive the glue-offload decision at every pool shape"
 	@echo "  allprog_check build all kernels as one program, acquire every kernel"
 	@echo "  asan_check    rebuild+run the host-only benches under ASan+UBSan"
 	@echo "  gh_gen        regenerate both Gauss-Hermite headers, then gh_check"
@@ -282,18 +363,19 @@ help:
 	@echo "  deficit_gen   regenerate both deficit-table headers, then deficit_check"
 	@echo "  deficit_full_check  regenerate from scratch and byte-compare (~25 s)"
 	@echo "  tf_export_check  real checkpoint -> binary -> OpenCL graph (skips if absent)"
-	@echo "  <name>_bench  build+run one bench (cf op decomp frontend pipeline rate rx"
+	@echo "  <name>_bench  build+run one bench (cf op decomp frontend pipeline sched rate fec rx"
 	@echo "                lmmse modem datapath chain tf)"
 	@echo "  clean         remove binaries and .d files (keeps *.bin, experiments/)"
 	@echo "  distclean     remove the whole build/ tree"
 	@echo "variables: CXX=$(CXX)  PY=$(PY)  DEV=$(DEV) (cpu|gpu|acc)"
 
 .PHONY: cf_ref cf_bench op_bench tf_bench decomp_bench frontend_bench pipeline_bench \
-        op_pl_bench modem_bench datapath_bench datapath_pl_bench rate_bench \
+        op_pl_bench modem_bench datapath_bench datapath_pl_bench rate_bench fec_bench \
         rx_bench \
-        lmmse_bench chain_bench \
+        lmmse_bench chain_bench sched_bench \
         gh_check \
-        registry_check capacity_check deficit_check allprog_check asan_check \
+        registry_check capacity_check glue_cost_check deficit_check \
+        allprog_check asan_check \
         gh_gen deficit_gen deficit_full_check \
         tf_export_check check \
         clean distclean help
